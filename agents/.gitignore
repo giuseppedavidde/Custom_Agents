@@ -152,3 +152,4 @@ cython_debug/
 
 # OS specific
 .DS_Store
+custom_agents.egg-info/*

@@ -34,6 +34,56 @@ except ImportError:
     PYMUPDF_AVAILABLE = False
     fitz = None
 
+try:
+    import groq
+
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+
+
+class GroqWrapper:
+    """Wrapper per Groq (LPU Inference Engine)."""
+
+    def __init__(self, provider, model_name: str, json_mode: bool = False):
+        self.provider = provider
+        self.model_name = model_name or "llama-3.3-70b-versatile"
+        self.json_mode = json_mode
+        self.client = groq.Groq(api_key=self.provider.api_key)
+
+    def generate_content(self, prompt: Any):
+        """Genera contenuto usando Groq."""
+        try:
+            # Prepare content (Groq uses OpenAI-style messages)
+            content = ""
+            if isinstance(prompt, str):
+                content = prompt
+            elif isinstance(prompt, list):
+                # Simple concatenation for text parts; skipping images for now as Groq is text-first (mostly)
+                for part in prompt:
+                    if isinstance(part, str):
+                        content += part + "\n"
+                    elif isinstance(part, dict) and "data" in part:
+                        content += "\n[Image/File attached - Groq Vision not yet fully implemented in this wrapper]\n"
+
+            messages = [{"role": "user", "content": content}]
+
+            response = self.client.chat.completions.create(
+                messages=messages,
+                model=self.model_name,
+                response_format={"type": "json_object"} if self.json_mode else None,
+            )
+
+            # Simulate response object with .text attribute
+            class Response:
+                def __init__(self, text):
+                    self.text = text
+
+            return Response(response.choices[0].message.content)
+
+        except Exception as e:
+            raise RuntimeError(f"Groq Error: {e}")
+
 
 class OllamaWrapper:
     """Wrapper per chiamate a modelli locali via Ollama."""
@@ -317,6 +367,16 @@ class AIProvider:
         "gemini-1.5-pro",
     ]
 
+    GROQ_MODELS = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "llama3-70b-8192",
+        "llama3-8b-8192",
+        "mixtral-8x7b-32768",
+        "gemma2-9b-it",
+        "gemma-7b-it",
+    ]
+
     _cached_chain: Optional[List[str]] = None
     _last_scrape_time: float = 0
 
@@ -333,8 +393,11 @@ class AIProvider:
         self.provider_type = provider_type.lower()
         self.target_model = model_name
 
-        # Gestione API Key: Priorità a quella passata, poi Env
-        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        # Gestione API Key: Priorità a quella passata, poi Env (specifico per provider)
+        if self.provider_type == "groq":
+            self.api_key = api_key or os.getenv("GROQ_API_KEY")
+        else:
+            self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
 
         self.debug_mode = os.getenv("AI_DEBUG", "true").lower() == "true"
 
@@ -364,6 +427,47 @@ class AIProvider:
                 f"🤖 AI Provider impostato su Ollama: {self.current_model_name}"
             )
 
+        elif self.provider_type == "groq":
+            if not GROQ_AVAILABLE:
+                raise ImportError(
+                    "Libreria 'groq' non installata. Esegui: pip install groq"
+                )
+            if not self.api_key:
+                print("⚠️ API Key mancante per Groq.")
+                # Non raisiamo qui per permettere alla UI di chiedere la key
+            self.current_model_name = self.target_model or "llama-3.3-70b-versatile"
+            self.log_debug(
+                f"🤖 AI Provider impostato su Groq: {self.current_model_name}"
+            )
+
+    @staticmethod
+    def get_groq_models(api_key: Optional[str] = None) -> List[str]:
+        """Recupera la lista dei modelli da Groq via API."""
+        api_key = api_key or os.getenv("GROQ_API_KEY")
+        if not api_key:
+            return AIProvider.GROQ_MODELS or []
+
+        url = "https://api.groq.com/openai/v1/models"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                # Extract model IDs
+                models = [m["id"] for m in data.get("data", [])]
+                # Filter/Sort if needed (e.g., prioritize llama-3)
+                return sorted(models)
+            else:
+                print(f"⚠️ Groq API Error {response.status_code}: {response.text}")
+                return AIProvider.GROQ_MODELS
+        except Exception as e:
+            print(f"⚠️ Error fetching Groq models: {e}")
+            return AIProvider.GROQ_MODELS
+
     @staticmethod
     def get_ollama_models() -> List[str]:
         """Recupera la lista dei modelli locali installati su Ollama."""
@@ -388,6 +492,8 @@ class AIProvider:
         """Restituisce l'istanza del modello AI richiesto."""
         if self.provider_type == "ollama":
             return OllamaWrapper(self.current_model_name, json_mode)
+        elif self.provider_type == "groq":
+            return GroqWrapper(self, self.current_model_name, json_mode)
         return GeminiWrapper(self, json_mode)
 
     def _init_gemini_chain(self):
