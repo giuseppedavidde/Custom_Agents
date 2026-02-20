@@ -15,5 +15,6 @@ setup(
         "streamlit",
         "PyGithub",
         "google-api-core",
+        "groq",
     ],
 )

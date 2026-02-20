@@ -1,3 +1,4 @@
+import os
 from .ai_provider import AIProvider
 import json
 from typing import List, Dict, Any, Optional
@@ -6,6 +7,24 @@ from typing import List, Dict, Any, Optional
 class TraderAgent:
     def __init__(self, provider_type="gemini", model_name=None):
         self.ai = AIProvider(provider_type=provider_type, model_name=model_name)
+        self.knowledge_base = self._load_knowledge()
+
+    def _load_knowledge(self):
+        import re
+
+        # Assicurati che il percorso sia corretto rispetto a dove salvi il file
+        kb_path = os.path.join(
+            os.path.dirname(__file__), "knowledge", "fontanills_options_knowledge.md"
+        )
+        try:
+            with open(kb_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                # Compressione lossless per l'LLM: eliminiamo spazi vuoti, righe vuote multiple e markdown visivo
+                content = re.sub(r"\n\s*\n", "\n", content)
+                content = re.sub(r"\*\*|\*|---", "", content)
+                return content.strip()
+        except FileNotFoundError:
+            return "Nessuna knowledge base trovata."
 
     def suggest_option_strategy(
         self,
@@ -16,6 +35,7 @@ class TraderAgent:
         underlying_price: float,
         time_horizon: str = "monthly",
         greeks_table: Optional[List[Dict]] = None,
+        iv: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """
         Ask the AI to suggest optimal option strategies based on technical analysis
@@ -32,7 +52,7 @@ class TraderAgent:
         trend = analysis.get("trend", "Unknown")
         rsi = analysis.get("rsi", "N/A")
         patterns = ", ".join(analysis.get("patterns", [])) or "None"
-        hv = analysis.get("hist_volatility")
+        hv = iv or analysis.get("hist_volatility")
 
         # Build compact indicator section (one line each)
         ind = [f"Price:{underlying_price:.2f} Trend:{trend} RSI:{rsi}"]
@@ -71,10 +91,33 @@ class TraderAgent:
         if len(nearby_strikes) < 4:
             nearby_strikes = sorted(strikes[:20])
 
-        # Filter expirations by time horizon
-        horizon_map = {"weekly": 1, "monthly": 2, "quarterly": 4}
-        max_exps = horizon_map.get(time_horizon, 2)
-        limited_exps = expirations[:max_exps]
+        # Filter expirations based on actual time difference from today
+        import datetime
+
+        today_date = datetime.date.today()
+
+        def get_days_to_exp(exp_str):
+            try:
+                exp_date = datetime.datetime.strptime(exp_str, "%Y%m%d").date()
+                return (exp_date - today_date).days
+            except:
+                return 0
+
+        # Target days for each horizon
+        horizon_targets = {
+            "weekly": 7,
+            "monthly": 30,
+            "quarterly": 90,
+        }
+        target_days = horizon_targets.get(time_horizon, 30)
+
+        # Sort ALL available expirations by how close they are to the target date
+        sorted_exps = sorted(
+            expirations, key=lambda x: abs(get_days_to_exp(x) - target_days)
+        )
+
+        # Take the top 3 closest expirations to give the AI options around that timeframe
+        limited_exps = sorted(sorted_exps[:3])
 
         horizon_label = {
             "weekly": "1-2wk",
@@ -85,8 +128,17 @@ class TraderAgent:
         # Build compact CSV Greeks table (no padding, short headers)
         greeks_text = ""
         if greeks_table:
+            # Filtro per inviare all'LLM solo i dati delle opzioni selezionate (risparmio drastico di token)
+            nearby_strikes_set = set(float(s) for s in nearby_strikes)
+            limited_exps_set = set(str(e) for e in limited_exps)
+
             greeks_lines = ["K,D,CΔ,CΘ,C$,PΔ,PΘ,P$,V"]
             for row in greeks_table:
+                if (
+                    float(row["strike"]) not in nearby_strikes_set
+                    or str(row["expiry"]) not in limited_exps_set
+                ):
+                    continue
                 c, p = row["call"], row["put"]
                 greeks_lines.append(
                     f"{row['strike']},{row['dte']},"
@@ -95,20 +147,30 @@ class TraderAgent:
                 )
             greeks_text = "\n".join(greeks_lines)
 
-        prompt = f"""Option strategy advisor. Real data below, computed via Black-Scholes.
+        import datetime
 
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+
+        prompt = f"""Sei un trader di opzioni istituzionale.
+I tuoi principi chiave sono basati su questa knowledge base teorica:
+
+CONOSCENZA TEORICA (Regole di Trading e Adjustments):
+{self.knowledge_base}
+
+DATI DI MERCATO REALI (Modello Black-Scholes):
+DATA ODIERNA: {today_str} (Usa questa data per calcolare i giorni a scadenza. Le scadenze sono nel formato YYYYMMDD. Esempio oggi e' 2026-02-20, la scadenza 20260223 e' a 3 giorni, non 4 mesi)
 {ticker}: {indicators_text}
 Horizon: {horizon_label}
 Expirations: {','.join(limited_exps)}
 Strikes: {','.join(str(s) for s in nearby_strikes)}
 """
         if greeks_text:
-            prompt += f"""Greeks(HV={((hv or 0.30)*100):.0f}%,r=5%):
+            prompt += f"""Greeks(IV={((hv or 0.30)*100):.1f}%,r=5%):
 {greeks_text}
 """
         prompt += """Rules: 3 strategies, ALL legs specified, use ONLY listed strikes/expirations.
 Respond ONLY valid JSON:
-{"strategies":[{"name":"...","direction":"BULLISH/BEARISH/NEUTRAL","legs":[{"action":"BUY/SELL","quantity":1,"strike":0.0,"right":"C/P","expiry":"YYYYMMDD"}],"rationale":"cite real indicators+greeks","max_profit":"$X","max_loss":"$X","breakeven":"X.XX","probability":65}]}"""
+{"strategies":[{"name":"...","direction":"BULLISH/BEARISH/NEUTRAL","legs":[{"action":"BUY/SELL","quantity":1,"strike":0.0,"right":"C/P","expiry":"YYYYMMDD"}],"rationale":"cite real indicators+greeks and ESPLICITARE LA VOLATILITA (IBKR IV) ASSUNTA NEL PRICING (mostrata in Greeks(IV=...)) come possibile fonte di discrepanza dal mercato reale","max_profit":"$X","max_loss":"$X","breakeven":"X.XX","calculations":"Mostra i calcoli matematici espliciti per profitto massimo, perdita massima e punti di pareggio basati sulla knowledge base","probability":65}]}"""
 
         try:
             model = self.ai.get_model(json_mode=True)
@@ -198,6 +260,7 @@ Respond ONLY valid JSON:
                 s.setdefault("max_profit", "N/A")
                 s.setdefault("max_loss", "N/A")
                 s.setdefault("breakeven", "N/A")
+                s.setdefault("calculations", "")
                 s.setdefault("probability", 50)
                 valid.append(s)
 
