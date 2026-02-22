@@ -503,6 +503,23 @@ class AIProvider:
             return AIProvider.GROQ_MODELS
 
     @staticmethod
+    def get_gemini_models() -> List[str]:
+        """Recupera la lista dei modelli Gemini disponibili (da cache o fallback)."""
+        if AIProvider._cached_chain and (
+            time.time() - AIProvider._last_scrape_time < 3600
+        ):
+            return AIProvider._cached_chain
+
+        try:
+            temp_provider = AIProvider(provider_type="gemini")
+            if temp_provider.available_models_chain:
+                return temp_provider.available_models_chain
+        except Exception:
+            pass
+
+        return AIProvider.FALLBACK_ORDER
+
+    @staticmethod
     def get_ollama_models() -> List[str]:
         """Recupera la lista dei modelli locali installati su Ollama."""
         if not OLLAMA_AVAILABLE:
