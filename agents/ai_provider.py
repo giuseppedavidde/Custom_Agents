@@ -441,6 +441,11 @@ class AIProvider:
             )
 
     @staticmethod
+    def get_supported_providers() -> List[str]:
+        """Restituisce la lista dei provider supportati."""
+        return ["Gemini", "Groq", "Ollama"]
+
+    @staticmethod
     def get_groq_models(api_key: Optional[str] = None) -> List[str]:
         """Recupera la lista dei modelli da Groq via API."""
         api_key = api_key or os.getenv("GROQ_API_KEY")
