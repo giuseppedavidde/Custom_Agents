@@ -382,7 +382,7 @@ class GeminiWrapper:
 class AIProvider:
     """Factory per modelli AI (Cloud/Local) con Caching."""
 
-    DOCS_URL = "https://ai.google.dev/gemini-api/docs/models?hl=it"
+    DOCS_URL = "https://ai.google.dev/gemini-api/docs/models.md.txt?hl=it"
     # Fallback solidi per Gemini: Rimosso 2.0-flash per instabilità (429 errors)
     FALLBACK_ORDER = [
         "gemini-3-pro-preview",
@@ -559,7 +559,12 @@ class AIProvider:
             self.available_models_chain = AIProvider._cached_chain
         # Altrimenti scraping
         else:
-            self.available_models_chain = self._build_gemini_chain()
+            scraped_models = self._build_gemini_chain()
+            # Uniamo i fallback (che includono i preview) con quelli trovati dallo scraping, rimuovendo duplicati e preservando l'ordine
+            self.available_models_chain = list(
+                dict.fromkeys(self.FALLBACK_ORDER + scraped_models)
+            )
+
             if self.available_models_chain:
                 AIProvider._cached_chain = self.available_models_chain
                 AIProvider._last_scrape_time = time.time()
@@ -587,19 +592,31 @@ class AIProvider:
     def _build_gemini_chain(self) -> List[str]:
         """Costruisce lista modelli via scraping."""
         try:
-            response = requests.get(self.DOCS_URL, timeout=2)
+            response = requests.get(self.DOCS_URL, timeout=4)
             if response.status_code != 200:
-                return []
-            soup = BeautifulSoup(response.text, "html.parser")
-            text = soup.get_text()
-            # Simple regex to catch model names from text, fallback logic applies otherwise
-            candidates = set(re.findall(r"(gemini-[a-zA-Z0-9\-\.]+)", text))
+                response = requests.get(self.DOCS_URL.replace(".md.txt", ""), timeout=4)
+                if response.status_code != 200:
+                    return []
+
+            text = response.text
+            # Try to catch model names from markdown links (e.g. models/(gemini-3.1-pro-preview))
+            candidates = set(re.findall(r"models/(gemini-[a-zA-Z0-9\-\.]+)", text))
+
+            # Fallback for plain text or HTML if no models found
+            if not candidates:
+                soup = BeautifulSoup(text, "html.parser")
+                text = soup.get_text()
+                candidates = set(re.findall(r"(gemini-[a-zA-Z0-9\-\.]+)", text))
+
             # Strip trailing periods from sentence endings
             candidates = {m.rstrip(".") for m in candidates}
             valid = [
                 m
                 for m in candidates
-                if "vision" not in m and "audio" not in m and "tts" not in m
+                if "vision" not in m
+                and "audio" not in m
+                and "tts" not in m
+                and "image" not in m
             ]
             # Prioritizza quelli con 'flash' o 'pro'
             return sorted(valid, reverse=True)
