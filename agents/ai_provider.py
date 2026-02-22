@@ -84,6 +84,35 @@ class GroqWrapper:
         except Exception as e:
             raise RuntimeError(f"Groq Error: {e}")
 
+    def generate_stream(self, prompt: Any):
+        """Genera in streaming usando Groq."""
+        try:
+            content = ""
+            if isinstance(prompt, str):
+                content = prompt
+            elif isinstance(prompt, list):
+                for part in prompt:
+                    if isinstance(part, str):
+                        content += part + "\n"
+                    elif isinstance(part, dict) and "data" in part:
+                        content += "\n[Image/File attached - Groq Vision not yet fully implemented in this wrapper]\n"
+
+            messages = [{"role": "user", "content": content}]
+
+            stream = self.client.chat.completions.create(
+                messages=messages,
+                model=self.model_name,
+                response_format={"type": "json_object"} if self.json_mode else None,
+                stream=True,
+            )
+
+            for chunk in stream:
+                if chunk.choices[0].delta.content is not None:
+                    yield chunk.choices[0].delta.content
+
+        except Exception as e:
+            yield f"❌ Errore Groq Stream: {e}"
+
 
 class OllamaWrapper:
     """Wrapper per chiamate a modelli locali via Ollama."""
