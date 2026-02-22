@@ -1,0 +1,10 @@
+google-genai
+ollama
+requests
+beautifulsoup4
+pymupdf
+pandas
+streamlit
+PyGithub
+google-api-core
+groq
