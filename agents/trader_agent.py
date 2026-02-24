@@ -194,21 +194,23 @@ Respond ONLY valid JSON:
                 for row in greeks_table:
                     greeks_lookup[(row["strike"], row["expiry"])] = row
 
-            # Convert available data to sets for fast lookup
-            valid_strikes_set = set(float(s) for s in strikes)
-            valid_exps_set = set(expirations)
+            # Convert available data to sets for fast lookup (Restricting to the subset provided to LLM)
+            valid_strikes_set = set(float(s) for s in nearby_strikes)
+            valid_exps_set = set(limited_exps)
             sorted_strikes = sorted(valid_strikes_set)
 
             # Validate and enrich each strategy
             valid = []
             for s in strategies[:3]:
-                if "name" not in s or "legs" not in s:
+                if not isinstance(s, dict) or "name" not in s or "legs" not in s:
                     continue
                 valid_legs = []
                 for leg in s.get("legs", []):
+                    if not isinstance(leg, dict):
+                        continue
                     if all(k in leg for k in ("action", "strike", "right", "expiry")):
-                        leg["action"] = leg["action"].upper()
-                        leg["right"] = leg["right"].upper()
+                        leg["action"] = str(leg["action"]).upper()
+                        leg["right"] = str(leg["right"]).upper()
                         leg.setdefault("quantity", 1)
                         if leg["right"] not in ("C", "P"):
                             leg["right"] = "C"
@@ -217,8 +219,12 @@ Respond ONLY valid JSON:
 
                         # ── STRICT VALIDATION ──────────────────────────
                         # Snap strike to nearest valid IBKR strike
-                        leg_strike = float(leg["strike"])
-                        if leg_strike not in valid_strikes_set:
+                        try:
+                            leg_strike = float(leg["strike"])
+                        except (ValueError, TypeError):
+                            leg_strike = 0.0
+
+                        if leg_strike not in valid_strikes_set and valid_strikes_set:
                             nearest = min(
                                 sorted_strikes, key=lambda x: abs(x - leg_strike)
                             )
@@ -231,11 +237,17 @@ Respond ONLY valid JSON:
                             leg["strike"] = leg_strike
 
                         # Snap expiry to nearest valid IBKR expiry
-                        leg_exp = str(leg["expiry"])
-                        if leg_exp not in valid_exps_set:
-                            nearest_exp = min(
-                                expirations, key=lambda x: abs(int(x) - int(leg_exp))
-                            )
+                        leg_exp = str(leg["expiry"]).strip()
+                        if leg_exp not in valid_exps_set and valid_exps_set:
+                            try:
+                                # Try to parse as int to find nearest, fallback to first if invalid
+                                exp_int = int(leg_exp)
+                                nearest_exp = min(
+                                    limited_exps, key=lambda x: abs(int(x) - exp_int)
+                                )
+                            except (ValueError, TypeError):
+                                nearest_exp = limited_exps[0]
+
                             print(
                                 f"⚠️ Expiry {leg_exp} not in IBKR chain → snapped to {nearest_exp}"
                             )
