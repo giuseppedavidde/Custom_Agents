@@ -7,24 +7,32 @@ from typing import List, Dict, Any, Optional
 class TraderAgent:
     def __init__(self, provider_type="gemini", model_name=None):
         self.ai = AIProvider(provider_type=provider_type, model_name=model_name)
-        self.knowledge_base = self._load_knowledge()
+        self.knowledge = self._load_knowledge()
+        # Backward-compat alias used by suggest_option_strategy prompt
+        self.knowledge_base = self.knowledge.get("options", "")
 
-    def _load_knowledge(self):
+    @staticmethod
+    def _load_kb_file(filename: str) -> str:
+        """Load and lossless-compress a single knowledge markdown file."""
         import re
 
-        # Assicurati che il percorso sia corretto rispetto a dove salvi il file
-        kb_path = os.path.join(
-            os.path.dirname(__file__), "knowledge", "fontanills_options_knowledge.md"
-        )
+        kb_path = os.path.join(os.path.dirname(__file__), "knowledge", filename)
         try:
             with open(kb_path, "r", encoding="utf-8") as f:
                 content = f.read()
-                # Compressione lossless per l'LLM: eliminiamo spazi vuoti, righe vuote multiple e markdown visivo
+                # Compressione lossless: rimuove righe vuote multiple e markdown visivo
                 content = re.sub(r"\n\s*\n", "\n", content)
                 content = re.sub(r"\*\*|\*|---", "", content)
                 return content.strip()
         except FileNotFoundError:
-            return "Nessuna knowledge base trovata."
+            return ""
+
+    def _load_knowledge(self) -> dict:
+        """Load all knowledge bases into a dict keyed by domain."""
+        return {
+            "options": self._load_kb_file("fontanills_options_knowledge.md"),
+            "vpa": self._load_kb_file("coulling_volman_knowledge.md"),
+        }
 
     def suggest_option_strategy(
         self,
@@ -160,17 +168,18 @@ CONOSCENZA TEORICA (Regole di Trading e Adjustments):
 DATI DI MERCATO REALI (Modello Black-Scholes):
 DATA ODIERNA: {today_str} (Usa questa data per calcolare i giorni a scadenza. Le scadenze sono nel formato YYYYMMDD. Esempio oggi e' 2026-02-20, la scadenza 20260223 e' a 3 giorni, non 4 mesi)
 {ticker}: {indicators_text}
-Horizon: {horizon_label}
-Expirations: {','.join(limited_exps)}
+Horizon (Categoria): {horizon_label}
+SCADENZA ESATTA DA UTILIZZARE (OBBLIGATORIO): {','.join(limited_exps)}
 Strikes: {','.join(str(s) for s in nearby_strikes)}
 """
         if greeks_text:
             prompt += f"""Greeks(IV={((hv or 0.30)*100):.1f}%,r=5%):
 {greeks_text}
 """
-        prompt += """Rules: 3 strategies, ALL legs specified, use ONLY listed strikes/expirations.
+        prompt += """Rules: 3 strategies, ALL legs specified, use ONLY listed strikes and the EXACT EXPIRATION DATE provided above. Do not invent dates.
+ATTENZIONE ALLA MATEMATICA: Devi agire come una calcolatrice rigorosa. Quando sommi o sottrai decimali (es. 24.5 + 0.18), fallo passo dopo passo per evitare allucinazioni (il risultato è 24.68, non 26.30).  NON INVENTARE MAI LA MATEMATICA.
 Respond ONLY valid JSON:
-{"strategies":[{"name":"...","direction":"BULLISH/BEARISH/NEUTRAL","legs":[{"action":"BUY/SELL","quantity":1,"strike":0.0,"right":"C/P","expiry":"YYYYMMDD"}],"rationale":"cite real indicators+greeks and ESPLICITARE LA VOLATILITA (IBKR IV) ASSUNTA NEL PRICING (mostrata in Greeks(IV=...)) come possibile fonte di discrepanza dal mercato reale","max_profit":"$X","max_loss":"$X","breakeven":"X.XX","calculations":"Mostra i calcoli matematici espliciti per profitto massimo, perdita massima e punti di pareggio basati sulla knowledge base","probability":65}]}"""
+{"strategies":[{"name":"...","direction":"BULLISH/BEARISH/NEUTRAL","legs":[{"action":"BUY/SELL","quantity":1,"strike":0.0,"right":"C/P","expiry":"YYYYMMDD"}],"rationale":"cite real indicators+greeks and ESPLICITARE LA VOLATILITA (IBKR IV) ASSUNTA NEL PRICING (mostrata in Greeks(IV=...)) come possibile fonte di discrepanza dal mercato reale","max_profit":"$X","max_loss":"$X","breakeven":"X.XX","calculations":"Mostra i calcoli matematici espliciti, SCRITTI PASSO PER PASSO COME UN'EQUAZIONE VERIFICATA PUNTUALMENTE (es: 24.50 + 0.18 = 24.68) per profitto massimo, perdita massima e punti di pareggio","probability":65}]}"""
 
         try:
             model = self.ai.get_model(json_mode=True)
@@ -267,6 +276,97 @@ Respond ONLY valid JSON:
                     continue
 
                 s["legs"] = valid_legs
+
+                # ── STRICT MATH CALCULATOR ─────────────────────────
+                # We calculate P/L locally rather than trusting AI arithmetic
+                try:
+                    net_cost = 0.0
+                    for leg in valid_legs:
+                        # Find price from greeks mapped earlier or fallback to 0
+                        leg_price = leg.get("greeks", {}).get("price", 0.0)
+                        if leg["action"] == "BUY":
+                            net_cost += leg_price * leg["quantity"]
+                        else:
+                            net_cost -= leg_price * leg["quantity"]
+
+                    net_cost = round(net_cost, 2)
+                    is_credit = net_cost < 0
+                    abs_cost = abs(net_cost)
+                    premium = round(abs_cost * 100, 2)
+
+                    # Very basic spread logic: assumed 1x1 vertical spread for breakeven/max risk
+                    if (
+                        len(valid_legs) == 2
+                        and valid_legs[0]["quantity"] == 1
+                        and valid_legs[1]["quantity"] == 1
+                    ):
+                        strike1 = valid_legs[0]["strike"]
+                        strike2 = valid_legs[1]["strike"]
+                        width = abs(strike1 - strike2)
+                        max_risk = (
+                            premium
+                            if not is_credit
+                            else round((width * 100) - premium, 2)
+                        )
+                        max_reward = (
+                            premium if is_credit else round((width * 100) - premium, 2)
+                        )
+
+                        # Approximated Breakeven for standard verticals
+                        is_call = valid_legs[0]["right"] == "C"
+                        if is_call:  # Bull Call / Bear Call
+                            lower_strike = min(strike1, strike2)
+                            be = (
+                                lower_strike + abs_cost
+                                if not is_credit
+                                else lower_strike + abs_cost
+                            )
+                        else:  # Bull Put / Bear Put
+                            higher_strike = max(strike1, strike2)
+                            be = (
+                                higher_strike - abs_cost
+                                if not is_credit
+                                else higher_strike - abs_cost
+                            )
+
+                        calc_text = (
+                            f"Python Math Engine:\n"
+                            f"Net Premium: ${premium} ({'Credit' if is_credit else 'Debit'} di {abs_cost} * 100)\n"
+                            f"Max Risk: ${max_risk}\n"
+                            f"Max Reward: ${max_reward}\n"
+                            f"Breakeven (Approx): {round(be, 2)}\n"
+                        )
+                        s["max_profit"] = f"${max_reward}"
+                        s["max_loss"] = f"${max_risk}"
+                        s["breakeven"] = str(round(be, 2))
+                        s["calculations"] = (
+                            calc_text
+                            + "\n(AI Rationale: "
+                            + str(s.get("calculations", ""))
+                            + ")"
+                        )
+                    else:
+                        # Single leg or complex
+                        if len(valid_legs) == 1:
+                            leg = valid_legs[0]
+                            max_risk = (
+                                premium if leg["action"] == "BUY" else "Unlimited"
+                            )
+                            be = (
+                                leg["strike"] + abs_cost
+                                if leg["right"] == "C"
+                                else leg["strike"] - abs_cost
+                            )
+                            s["max_loss"] = f"${max_risk}"
+                            s["breakeven"] = str(round(be, 2))
+                            s["calculations"] = (
+                                f"Python Math: Premium pagato ${premium}. Breakeven = {leg['strike']} {'+' if leg['right']=='C' else '-'} {abs_cost} = {round(be, 2)}\n\nAI: {s.get('calculations', '')}"
+                            )
+                except Exception as ex:
+                    print(
+                        f"⚠️ Local math overlay failed, falling back to AI texts. Err: {ex}"
+                    )
+
                 s.setdefault("direction", "NEUTRAL")
                 s.setdefault("rationale", "")
                 s.setdefault("max_profit", "N/A")
@@ -309,24 +409,36 @@ Respond ONLY valid JSON:
         trend = active_analysis.get("trend", "Unknown")
         patterns = ", ".join(active_analysis.get("patterns", [])) or "None"
 
-        prompt = f"""
-Sei un trader esperto e analista quantitativo. Analizza i seguenti dati tecnici per {ticker} sul timeframe {timeframe}:
+        # Inject Coulling/Volman VPA knowledge for market analysis context
+        vpa_knowledge = self.knowledge.get("vpa", "")
+        vpa_section = ""
+        if vpa_knowledge:
+            vpa_section = f"""\nCONOSCENZA TEORICA (VPA & Price Action - Coulling/Volman):
+{vpa_knowledge}
+"""
 
+        prompt = f"""Sei un trader esperto e analista quantitativo, specializzato in Volume Price Analysis (VPA) e Price Action.
+I tuoi principi chiave sono basati su questa knowledge base teorica:
+{vpa_section}
 DATI DI MERCATO:
+- Ticker: {ticker}
+- Timeframe: {timeframe}
 - Prezzo Attuale: {price}
 - Trend Tecnico (EMA): {trend}
 - RSI (14): {rsi}
 - Pattern Rilevati: {patterns}
 
 OBIETTIVO:
-Analizza la situazione di mercato basandoti SOLO su questi numeri e sulla tua conoscenza dei mercati finanziari.
+Analizza la situazione di mercato usando i principi di Volume Price Analysis (Anna Coulling) e i setup operativi a 5 minuti (Bob Volman).
+Applica le anomalie prezzo-volume (Sforzo senza Risultato, Risultato senza Sforzo, Selling Climax, Stopping Volume, Divergenza Trend/Volume) ai dati forniti.
+Identifica eventuali setup operativi Volman (Pattern Break, Pullback Reversal, Trade-for-Failure, etc.) se applicabili al timeframe.
 Non inventare dati. Se i dati sono contrastanti, dillo.
 
 FORMATO RISPOSTA RICHIESTO:
-1. **Analisi Sintetica**: Spiega cosa suggeriscono gli indicatori (max 3 righe).
-2. **Setup**: C'è un'opportunità di trading? (Sì/No/Forse)
+1. **Analisi VPA**: Valuta il rapporto prezzo-volume e identifica anomalie (max 3 righe).
+2. **Setup Volman**: C'è un setup operativo riconoscibile? (Sì/No/Forse) — specifica quale.
 3. **Direzione**: Long / Short / Wait
-4. **Livelli Chiave**: Suggerisci uno Stop Loss logico e un Take Profit basato sulla volatilità implicita nel trend.
+4. **Livelli Chiave**: Suggerisci Stop Loss (10 pip/tick standard) e Take Profit (20 pip/tick target) basati sui magneti di prezzo.
 5. **Probabilità**: Dai una stima percentuale di successo (es. 60%).
 """
 
