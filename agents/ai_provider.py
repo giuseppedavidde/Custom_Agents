@@ -42,6 +42,79 @@ except ImportError:
     GROQ_AVAILABLE = False
 
 
+def process_multimodal_input(
+    prompt: Any, model_name: str = "Modello AI"
+) -> tuple[str, list]:
+    """
+    Estrae testo e immagini dal prompt multimodale.
+    Converte PDF in testo usando PyMuPDF per maggiore robustezza.
+    """
+    final_text_parts = []
+    images = []
+
+    print(f"🤖 Pre-processing: Analizzando input per {model_name}...")
+
+    if isinstance(prompt, list):
+        for i, part in enumerate(prompt):
+            if isinstance(part, str):
+                final_text_parts.append(part)
+            elif isinstance(part, dict) and "mime_type" in part and "data" in part:
+                mime = part["mime_type"]
+                data = part["data"]
+                size_kb = len(data) / 1024
+
+                print(f"   -> Part {i}: Rilevato {mime} ({size_kb:.1f} KB)")
+
+                if mime == "application/pdf":
+                    # PDF Text Extraction Handling with PyMuPDF
+                    if PYMUPDF_AVAILABLE:
+                        try:
+                            print("      -> Avvio estrazione PDF con PyMuPDF...")
+                            doc = fitz.open(stream=data, filetype="pdf")
+                            text_content = []
+                            for page_num, page in enumerate(doc):
+                                page_text = page.get_text()
+                                if page_text.strip():
+                                    text_content.append(page_text)
+                                print(
+                                    f"         Pagina {page_num+1}: {len(page_text)} caratteri estratti."
+                                )
+
+                            extracted = "\n".join(text_content)
+                            if extracted.strip():
+                                final_text_parts.append(
+                                    f"\n--- INIZIO CONTENUTO PDF ---\n{extracted}\n--- FINE CONTENUTO PDF ---\n"
+                                )
+                                print("      ✅ Estrazione completata con successo.")
+                            else:
+                                print(
+                                    "      ⚠️ WARNING: Il PDF sembra vuoto o contiene solo immagini (no OCR)."
+                                )
+                        except Exception as e:
+                            print(f"      ❌ Errore critico lettura PDF: {e}")
+                            final_text_parts.append(
+                                f"\n[ERRORE durante l'estrazione del PDF: {e}]\n"
+                            )
+                    else:
+                        print(
+                            "      ❌ PyMuPDF non installato! Impossibile leggere PDF."
+                        )
+                        final_text_parts.append(
+                            "\n[AVVISO: Impossibile leggere il PDF fornito perché la libreria PyMuPDF (fitz) non è installata. Esegui 'pip install pymupdf'.]\n"
+                        )
+                elif mime.startswith("image/"):
+                    images.append(data)
+                    print("      -> Immagine aggiunta al payload.")
+                else:
+                    print(f"      ⚠️ MIME type {mime} non supportato, ignorato.")
+    else:
+        final_text_parts.append(str(prompt))
+
+    full_text = "\n".join(final_text_parts)
+    print(f"📝 Prompt finale: {len(full_text)} caratteri, {len(images)} immagini.")
+    return full_text, images
+
+
 class GroqWrapper:
     """Wrapper per Groq (LPU Inference Engine)."""
 
@@ -54,17 +127,10 @@ class GroqWrapper:
     def generate_content(self, prompt: Any):
         """Genera contenuto usando Groq."""
         try:
-            # Prepare content (Groq uses OpenAI-style messages)
-            content = ""
-            if isinstance(prompt, str):
-                content = prompt
-            elif isinstance(prompt, list):
-                # Simple concatenation for text parts; skipping images for now as Groq is text-first (mostly)
-                for part in prompt:
-                    if isinstance(part, str):
-                        content += part + "\n"
-                    elif isinstance(part, dict) and "data" in part:
-                        content += "\n[Image/File attached - Groq Vision not yet fully implemented in this wrapper]\n"
+            content, images = process_multimodal_input(prompt, self.model_name)
+
+            if images:
+                content += "\n[Image attached - Groq Vision not yet fully implemented in this wrapper]\n"
 
             messages = [{"role": "user", "content": content}]
 
@@ -87,15 +153,10 @@ class GroqWrapper:
     def generate_stream(self, prompt: Any):
         """Genera in streaming usando Groq."""
         try:
-            content = ""
-            if isinstance(prompt, str):
-                content = prompt
-            elif isinstance(prompt, list):
-                for part in prompt:
-                    if isinstance(part, str):
-                        content += part + "\n"
-                    elif isinstance(part, dict) and "data" in part:
-                        content += "\n[Image/File attached - Groq Vision not yet fully implemented in this wrapper]\n"
+            content, images = process_multimodal_input(prompt, self.model_name)
+
+            if images:
+                content += "\n[Image attached - Groq Vision not yet fully implemented in this wrapper]\n"
 
             messages = [{"role": "user", "content": content}]
 
@@ -121,76 +182,10 @@ class OllamaWrapper:
         self.model_name = model_name
         self.json_mode = json_mode
 
-    def _process_multimodal_input(self, prompt: Any) -> tuple[str, list]:
-        """
-        Estrae testo e immagini dal prompt multimodale.
-        Converte PDF in testo usando PyMuPDF per maggiore robustezza.
-        """
-        final_text_parts = []
-        images = []
-
-        print(f"🤖 Ollama Pre-processing: Analizzando input per {self.model_name}...")
-
-        if isinstance(prompt, list):
-            for i, part in enumerate(prompt):
-                if isinstance(part, str):
-                    final_text_parts.append(part)
-                elif isinstance(part, dict) and "mime_type" in part and "data" in part:
-                    mime = part["mime_type"]
-                    data = part["data"]
-                    size_kb = len(data) / 1024
-
-                    print(f"   -> Part {i}: Rilevato {mime} ({size_kb:.1f} KB)")
-
-                    if mime == "application/pdf":
-                        # PDF Text Extraction Handling with PyMuPDF
-                        if PYMUPDF_AVAILABLE:
-                            try:
-                                print("      -> Avvio estrazione PDF con PyMuPDF...")
-                                doc = fitz.open(stream=data, filetype="pdf")
-                                text_content = []
-                                for page_num, page in enumerate(doc):
-                                    page_text = page.get_text()
-                                    if page_text.strip():
-                                        text_content.append(page_text)
-                                    print(
-                                        f"         Pagina {page_num+1}: {len(page_text)} caratteri estratti."
-                                    )
-
-                                extracted = "\n".join(text_content)
-                                if extracted.strip():
-                                    final_text_parts.append(
-                                        f"\n--- INIZIO CONTENUTO PDF ---\n{extracted}\n--- FINE CONTENUTO PDF ---\n"
-                                    )
-                                    print(
-                                        "      ✅ Estrazione completata con successo."
-                                    )
-                                else:
-                                    print(
-                                        "      ⚠️ WARNING: Il PDF sembra vuoto o contiene solo immagini (no OCR)."
-                                    )
-                            except Exception as e:
-                                print(f"      ❌ Errore critico lettura PDF: {e}")
-                        else:
-                            print(
-                                "      ❌ PyMuPDF non installato! Impossibile leggere PDF."
-                            )
-                    elif mime.startswith("image/"):
-                        images.append(data)
-                        print("      -> Immagine aggiunta al payload.")
-                    else:
-                        print(f"      ⚠️ MIME type {mime} non supportato, ignorato.")
-        else:
-            final_text_parts.append(str(prompt))
-
-        full_text = "\n".join(final_text_parts)
-        print(f"📝 Prompt finale: {len(full_text)} caratteri, {len(images)} immagini.")
-        return full_text, images
-
     def generate_content(self, prompt: Any):
         """Esegue la chiamata a Ollama."""
         try:
-            prompt_text, images = self._process_multimodal_input(prompt)
+            prompt_text, images = process_multimodal_input(prompt, self.model_name)
 
             # Opzioni per forzare l'uso della GPU e Context Size adeguato
             options = {
@@ -247,7 +242,7 @@ class OllamaWrapper:
     def generate_stream(self, prompt: Any):
         """Esegue la chiamata a Ollama in streaming."""
         try:
-            prompt_text, images = self._process_multimodal_input(prompt)
+            prompt_text, images = process_multimodal_input(prompt, self.model_name)
             options = {"num_gpu": 999}
 
             kwargs = {
@@ -503,7 +498,7 @@ class AIProvider:
             return AIProvider.GROQ_MODELS
 
     @staticmethod
-    def get_gemini_models() -> List[str]:
+    def get_gemini_models(api_key: Optional[str] = None) -> List[str]:
         """Recupera la lista dei modelli Gemini disponibili (da cache o fallback)."""
         if AIProvider._cached_chain and (
             time.time() - AIProvider._last_scrape_time < 3600
@@ -511,7 +506,7 @@ class AIProvider:
             return AIProvider._cached_chain
 
         try:
-            temp_provider = AIProvider(provider_type="gemini")
+            temp_provider = AIProvider(api_key=api_key, provider_type="gemini")
             if temp_provider.available_models_chain:
                 return temp_provider.available_models_chain
         except Exception:
