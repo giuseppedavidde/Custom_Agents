@@ -16,5 +16,6 @@ setup(
         "PyGithub",
         "google-api-core",
         "groq",
+        "openai",
     ],
 )

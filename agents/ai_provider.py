@@ -41,6 +41,13 @@ try:
 except ImportError:
     GROQ_AVAILABLE = False
 
+try:
+    import openai as openai_lib
+
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
 
 def process_multimodal_input(
     prompt: Any, model_name: str = "Modello AI"
@@ -374,6 +381,67 @@ class GeminiWrapper:
             yield f"❌ Errore Gemini Stream: {e}"
 
 
+class PuterWrapper:
+    """Wrapper per Claude via Puter.com OpenAI-compatible API (gratuito, senza Anthropic key)."""
+
+    PUTER_BASE_URL = "https://api.puter.com/puterai/openai/v1/"
+
+    def __init__(self, provider, model_name: str, json_mode: bool = False):
+        self.provider = provider
+        self.model_name = model_name or "claude-sonnet-4-6"
+        self.json_mode = json_mode
+        if not OPENAI_AVAILABLE:
+            raise ImportError("Libreria 'openai' non installata. Esegui: pip install openai")
+        self.client = openai_lib.OpenAI(
+            base_url=self.PUTER_BASE_URL,
+            api_key=self.provider.api_key or "dummy",  # Puter accepts any non-empty token
+        )
+
+    def _build_messages(self, prompt: Any) -> list:
+        """Converte il prompt (stringa o multimodale) in messaggi OpenAI."""
+        content, images = process_multimodal_input(prompt, self.model_name)
+        if images:
+            content += "\n[Note: Image attachments are not supported via Puter API wrapper]\n"
+        return [{"role": "user", "content": content}]
+
+    def generate_content(self, prompt: Any):
+        """Genera contenuto usando Puter/Claude (sincrono)."""
+        try:
+            messages = self._build_messages(prompt)
+            kwargs = {
+                "model": self.model_name,
+                "messages": messages,
+            }
+            if self.json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+
+            response = self.client.chat.completions.create(**kwargs)
+
+            class Response:
+                def __init__(self, text):
+                    self.text = text
+
+            return Response(response.choices[0].message.content)
+        except Exception as e:
+            raise RuntimeError(f"Puter/Claude Error: {e}") from e
+
+    def generate_stream(self, prompt: Any):
+        """Genera in streaming usando Puter/Claude."""
+        try:
+            messages = self._build_messages(prompt)
+            stream = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta is not None:
+                    yield delta
+        except Exception as e:
+            yield f"❌ Errore Puter/Claude Stream: {e}"
+
+
 class AIProvider:
     """Factory per modelli AI (Cloud/Local) con Caching."""
 
@@ -401,6 +469,22 @@ class AIProvider:
         "gemma-7b-it",
     ]
 
+    PUTER_CLAUDE_MODELS = [
+        "claude-sonnet-4-6",
+        "claude-opus-4-6",
+        "claude-haiku-4-5",
+        "claude-sonnet-4-5",
+        "claude-opus-4-5",
+        "claude-opus-4-1",
+        "claude-opus-4",
+        "claude-sonnet-4",
+        "claude-3-7-sonnet",
+        "claude-3-5-sonnet",
+        "claude-3-haiku",
+    ]
+
+    PUTER_BASE_URL = "https://api.puter.com/puterai/openai/v1/"
+
     _cached_chain: Optional[List[str]] = None
     _last_scrape_time: float = 0
 
@@ -420,6 +504,8 @@ class AIProvider:
         # Gestione API Key: Priorità a quella passata, poi Env (specifico per provider)
         if self.provider_type == "groq":
             self.api_key = api_key or os.getenv("GROQ_API_KEY")
+        elif self.provider_type == "puter":
+            self.api_key = api_key or os.getenv("PUTER_API_KEY")
         else:
             self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
 
@@ -464,10 +550,24 @@ class AIProvider:
                 f"🤖 AI Provider impostato su Groq: {self.current_model_name}"
             )
 
+        elif self.provider_type == "puter":
+            if not OPENAI_AVAILABLE:
+                raise ImportError(
+                    "Libreria 'openai' non installata. Esegui: pip install openai"
+                )
+            # For Puter, api_key holds the Puter auth token
+            self.api_key = api_key or os.getenv("PUTER_API_KEY")
+            if not self.api_key:
+                print("⚠️ PUTER_API_KEY mancante. Inserisci il token Puter.")
+            self.current_model_name = self.target_model or "claude-sonnet-4-6"
+            self.log_debug(
+                f"🤖 AI Provider impostato su Puter/Claude: {self.current_model_name}"
+            )
+
     @staticmethod
     def get_supported_providers() -> List[str]:
         """Restituisce la lista dei provider supportati."""
-        return ["Gemini", "Groq", "Ollama"]
+        return ["Gemini", "Groq", "Ollama", "Puter"]
 
     @staticmethod
     def get_groq_models(api_key: Optional[str] = None) -> List[str]:
@@ -529,6 +629,11 @@ class AIProvider:
             print(f"⚠️ Errore listing Ollama: {e}")
             return []
 
+    @staticmethod
+    def get_puter_models() -> List[str]:
+        """Restituisce la lista dei modelli Claude disponibili via Puter."""
+        return list(AIProvider.PUTER_CLAUDE_MODELS)
+
     def log_debug(self, message: str):
         """Log di debug se abilitato."""
         if self.debug_mode:
@@ -540,6 +645,8 @@ class AIProvider:
             return OllamaWrapper(self.current_model_name, json_mode)
         elif self.provider_type == "groq":
             return GroqWrapper(self, self.current_model_name, json_mode)
+        elif self.provider_type == "puter":
+            return PuterWrapper(self, self.current_model_name, json_mode)
         return GeminiWrapper(self, json_mode)
 
     def _init_gemini_chain(self):

@@ -12,5 +12,6 @@ Requires-Dist: streamlit
 Requires-Dist: PyGithub
 Requires-Dist: google-api-core
 Requires-Dist: groq
+Requires-Dist: openai
 Dynamic: requires-dist
 Dynamic: summary
