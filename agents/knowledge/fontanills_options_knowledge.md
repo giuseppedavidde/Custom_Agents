@@ -261,3 +261,63 @@ Le fonti specificano requisiti numerici chiari per filtrare le operazioni, scart
 *   **Identificare i Trend:** Un movimento giornaliero del prezzo pari o superiore al **20%** rispetto al giorno precedente è l'indicatore chiave per certificare un forte "momentum" (rialzista o ribassista) su cui operare.
 *   **Approccio Contrarian:** Per strategie di inversione, cercare azioni che abbiano subito un crollo di magnitudo pari o superiore al **50%** (Blow-off bottom), che segnalano potenziale esaurimento dei venditori (capitulation) e un imminente rimbalzo,. 
 *   **Prezzo base:** Titoli che scambiano sotto i **$20** sono considerati ideali per sfruttare una leva maggiore nei movimenti percentuali, mentre per le azioni sopra i **$25** gli strike price sono generalmente scanditi a intervalli di **$5**.
+*   
+[Iron Condor] - Gestione
+* Take Profit: Profit exit predefinita. Premi quasi azzerati dal decadimento temporale.
+* Stop Loss: Sottostante supera i breakeven point (Loss exit rigorosa).
+* Trigger Aggiustamento: Sottostante in forte trend minaccia gli strike corti venduti.
+* Azione (Adjustment): Rollare lo spread minacciato (up o down) e out nel tempo.
+
+[Bull Call Spread] - Gestione
+* Take Profit: Target numerico raggiunto allo strike superiore venduto.
+* Stop Loss: Chiusura se perdita non realizzata supera 70% debito iniziale.
+* Trigger Aggiustamento: Forte discesa del sottostante contro previsione rialzista.
+* Azione (Adjustment): Chiudere spread o rollare out nel tempo e down di strike.
+
+[Bear Put Spread] - Gestione
+* Take Profit: Sottostante raggiunge target dello strike venduto inferiore.
+* Stop Loss: Prezzo sale attivando ordine stop loss predefinito.
+* Trigger Aggiustamento: Inversione trend rialzista oltre area di breakeven.
+* Azione (Adjustment): Liquidare posizione limitando perdita al net debit.
+
+[Bear Call Spread] - Gestione
+* Take Profit: Decadimento temporale e calo IV svuotano il premio incassato.
+* Stop Loss: Prezzo rompe strike venduto attivando loss exit.
+* Trigger Aggiustamento: Sottostante in forte rialzo verso strike della Call corta.
+* Azione (Adjustment): Chiudere gambe attuali, rollare spread up e out nel tempo.
+
+[Bull Put Spread] - Gestione
+* Take Profit: Valore opzioni nullo per scadenza imminente.
+* Stop Loss: Sottostante scende sotto breakeven point inferiore.
+* Trigger Aggiustamento: Forte discesa prezzo minaccia Put venduta.
+* Azione (Adjustment): Chiudere spread attuale, rollare down e out nel tempo.
+
+[Long Straddle] - Gestione
+* Take Profit: Esplosione volatilità attesa realizzata oltre breakeven. Prelievo profitti.
+* Stop Loss: Decadimento Theta estremo senza esplosione direzionale.
+* Trigger Aggiustamento: Variazione prezzo sbilancia Delta originario. Intervalli time-based o event-based.
+* Azione (Adjustment): Comprare o vendere opzioni/azioni per riportare Position Delta a zero.
+
+[Short Straddle] - Gestione
+* Take Profit: Ritiro credito incassato dopo forte crollo volatilità (IV).
+* Stop Loss: Prezzo tocca stop-loss price (rischio illimitato intollerabile).
+* Trigger Aggiustamento: Movimento direzionale esplosivo verso uno degli strike ATM.
+* Azione (Adjustment): Delta hedge (shortare azioni fisse) o chiudere lato minacciato.
+
+[Long Strangle] - Gestione
+* Take Profit: Movimento massiccio oltre breakeven superiori/inferiori.
+* Stop Loss: Loss exit raggiunta a causa dell'erosione temporale.
+* Trigger Aggiustamento: Mercato direzionale altera esposizione delta neutral.
+* Azione (Adjustment): Ripristinare neutralità aggiungendo o rimuovendo opzioni OTM.
+
+[Short Strangle] - Gestione
+* Take Profit: Decadimento temporale porta opzioni a scadere senza valore.
+* Stop Loss: Rigido ordine stop prima del breakeven (rischio illimitato).
+* Trigger Aggiustamento: Prezzo attacca pericolosamente uno strike OTM venduto.
+* Azione (Adjustment): Rollare gamba minacciata out nel tempo o convertire in Iron Condor.
+
+[Calendar Spread] - Gestione
+* Take Profit: Regola "Risk one to make two" (incassare doppio del rischio).
+* Stop Loss: Sottostante rompe drasticamente i livelli di supporto/resistenza.
+* Trigger Aggiustamento: Scadenza opzione front-month vicina con prezzo stabile.
+* Azione (Adjustment): Roll out nel tempo chiudendo front-month e aprendo nuova.

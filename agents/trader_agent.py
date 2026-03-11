@@ -450,3 +450,94 @@ FORMATO RISPOSTA RICHIESTO:
             return response.text
         except Exception as e:
             return f"Error gathering AI analysis: {e}"
+
+    def scan_put_selling_candidates(
+        self, market_data: List[Dict[str, Any]], time_horizon: str = "monthly"
+    ) -> str:
+        """
+        Scan a list of market candidates to identify the best ones for
+        Cash-Secured Puts (first stage of Wheel Strategy).
+
+        Args:
+            market_data: List of dicts, each containing metrics like:
+                - ticker (str)
+                - price (float)
+                - iv (float)
+                - bid_ask_spread (float)
+                - trend (str)
+                - rsi (float)
+            time_horizon: The user's intended investment horizon (e.g. weekly, monthly, quarterly)
+
+        Returns:
+            JSON string containing the ranked candidates and rationale.
+        """
+        # Inject Options Knowledge
+        options_knowledge = self.knowledge.get("options", "")
+
+        # Build market data block
+        data_text_lines = []
+        for item in market_data:
+            line = (
+                f"- Ticker: {item.get('ticker')}, Price: {item.get('price')}, "
+                f"IV: {item.get('iv', 'N/A')}, Spread: {item.get('bid_ask_spread', 'N/A')}, "
+                f"Trend: {item.get('trend', 'N/A')}, RSI: {item.get('rsi', 'N/A')}"
+            )
+            data_text_lines.append(line)
+
+        data_text = "\n".join(data_text_lines)
+
+        prompt = f"""Sei un trader esperto specializzato nella Wheel Strategy.
+La tua conoscenza teorica di base:
+{options_knowledge}
+
+Il tuo compito odierno è analizzare la seguente lista di ticker e trovare i MIGLIORI candidati per la fase 1 della Wheel Strategy: Vendita di Cash-Secured Puts.
+
+ORIZZONTE TEMPORALE SCELTO DALL'UTENTE: {time_horizon}
+Tieni conto di questo orizzonte temporale quando suggerisci il delta e valuti se la volatilità o il trend attuale sono adatti (es. trend di breve vs lungo periodo).
+
+Criteri chiave per la scelta:
+1) Titoli di altissima qualità o ETF solidi (es. AAPL, MSFT, SPY, QQQ).
+2) Spread Bid/Ask molto stretto (alta liquidità, indica facilità di entrata/uscita).
+3) IV (Implied Volatility) relativamente alta, per incassare premi sostanziosi (generalmente IV Rank alto o IV > 30%), ma senza che sia sintomo di imminente bancarotta o cigno nero.
+4) Trend preferibilmente non in caduta libera (evitare i "falling knives"), cercando trend laterali o rialzisti con un pullback temporaneo (es. RSI in ipervenduto in un trend primario toro).
+
+DATI DI MERCATO (Scansione Attuale):
+{data_text}
+
+Rispondi ESCLUSIVAMENTE con un JSON valido strutturato in questo modo, analizzando ogni ticker fornito:
+{{
+  "best_candidates": [
+    {{
+      "ticker": "...",
+      "score": "1-10",
+      "rationale": "Spiega perché è eccellente per una Cash-Secured Put in base ai criteri specifici.",
+      "suggested_delta": "es. 0.20-0.30"
+    }}
+  ],
+  "rejected_candidates": [
+    {{
+      "ticker": "...",
+      "reason": "Perché lo hai scartato (es. spread troppo largo, trend pessimo, scarsa qualità)."
+    }}
+  ],
+  "market_overview": "Breve riassunto della situazione."
+}}
+"""
+
+        try:
+            model = self.ai.get_model(json_mode=True)
+            response = model.generate_content(prompt)
+            text = response.text.strip()
+
+            # Clean potential markdown code fences
+            if text.startswith("```"):
+                lines = text.split("\n")
+                text = "\n".join(lines[1:])
+                if text.startswith("json"):
+                    text = text[4:].strip()
+            if text.endswith("```"):
+                text = text[:-3]
+
+            return text.strip()
+        except Exception as e:
+            return f'{{"error": "Failed to gather AI candidate analysis: {e}"}}'
