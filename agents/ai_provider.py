@@ -469,18 +469,18 @@ class AIProvider:
         "gemma-7b-it",
     ]
 
-    PUTER_CLAUDE_MODELS = [
+    PUTER_MODELS = [
+        "claude-3-7-sonnet",
+        "claude-3-5-sonnet",
+        "claude-3-haiku",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro",
+        "gemini-1.5-flash",
         "claude-sonnet-4-6",
         "claude-opus-4-6",
         "claude-haiku-4-5",
         "claude-sonnet-4-5",
-        "claude-opus-4-5",
-        "claude-opus-4-1",
-        "claude-opus-4",
-        "claude-sonnet-4",
-        "claude-3-7-sonnet",
-        "claude-3-5-sonnet",
-        "claude-3-haiku",
     ]
 
     PUTER_BASE_URL = "https://api.puter.com/puterai/openai/v1/"
@@ -631,8 +631,8 @@ class AIProvider:
 
     @staticmethod
     def get_puter_models() -> List[str]:
-        """Restituisce la lista dei modelli Claude disponibili via Puter."""
-        return list(AIProvider.PUTER_CLAUDE_MODELS)
+        """Restituisce la lista dei modelli AI (Claude/Gemini) disponibili via Puter."""
+        return list(AIProvider.PUTER_MODELS)
 
     def log_debug(self, message: str):
         """Log di debug se abilitato."""

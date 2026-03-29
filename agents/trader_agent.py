@@ -408,6 +408,7 @@ Respond ONLY valid JSON:
         rsi = active_analysis.get("rsi", "N/A")
         trend = active_analysis.get("trend", "Unknown")
         patterns = ", ".join(active_analysis.get("patterns", [])) or "None"
+        volume = active_analysis.get("volume_info", "N/A")
 
         # Inject Coulling/Volman VPA knowledge for market analysis context
         vpa_knowledge = self.knowledge.get("vpa", "")
@@ -426,6 +427,7 @@ DATI DI MERCATO:
 - Prezzo Attuale: {price}
 - Trend Tecnico (EMA): {trend}
 - RSI (14): {rsi}
+- Volumi: {volume}
 - Pattern Rilevati: {patterns}
 
 OBIETTIVO:
