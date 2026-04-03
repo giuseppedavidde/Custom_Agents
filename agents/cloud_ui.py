@@ -46,10 +46,16 @@ def render_cloud_sync_ui(DATA_FILE, is_sidebar=True):
             selected_repo = None
 
             if repo_list:
+                # Pre-seleziona la repo preferita del Budget App se disponibile
+                preferred_repo = "giuseppedavidde/StreamLitPrj"
+                preferred_repo_idx = 0
+                if preferred_repo in repo_list:
+                    preferred_repo_idx = repo_list.index(preferred_repo)
+
                 selected_repo = st.selectbox(
                     "Seleziona Repository",
                     repo_list,
-                    index=0,
+                    index=preferred_repo_idx,
                     key=f"sel_repo_{'sb' if is_sidebar else 'main'}",
                 )
             else:
@@ -69,8 +75,15 @@ def render_cloud_sync_ui(DATA_FILE, is_sidebar=True):
 
                 if file_list:
                     default_idx = 0
-                    if "Budget App/budget_database.csv" in file_list:
-                        default_idx = file_list.index("Budget App/budget_database.csv")
+                    # Cerca il file del Budget App nella repo StreamLitPrj
+                    preferred_files = [
+                        "Budget_App/budget_database.csv",
+                        "Budget App/budget_database.csv",
+                    ]
+                    for pf in preferred_files:
+                        if pf in file_list:
+                            default_idx = file_list.index(pf)
+                            break
 
                     selected_file_remote = st.selectbox(
                         "File CSV",

@@ -459,7 +459,11 @@ class AIProvider:
         "gemini-1.5-pro",
     ]
 
+    # Preferred model for PDF reading: moonshotai/kimi-k2-instruct
+    PREFERRED_GROQ_MODEL = "moonshotai/kimi-k2-instruct"
+
     GROQ_MODELS = [
+        "moonshotai/kimi-k2-instruct",  # Best for PDF reading
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",
         "llama3-70b-8192",
@@ -545,7 +549,7 @@ class AIProvider:
             if not self.api_key:
                 print("⚠️ API Key mancante per Groq.")
                 # Non raisiamo qui per permettere alla UI di chiedere la key
-            self.current_model_name = self.target_model or "llama-3.3-70b-versatile"
+            self.current_model_name = self.target_model or AIProvider.PREFERRED_GROQ_MODEL
             self.log_debug(
                 f"🤖 AI Provider impostato su Groq: {self.current_model_name}"
             )
@@ -571,7 +575,11 @@ class AIProvider:
 
     @staticmethod
     def get_groq_models(api_key: Optional[str] = None) -> List[str]:
-        """Recupera la lista dei modelli da Groq via API."""
+        """Recupera la lista dei modelli da Groq via API.
+
+        Se moonshotai/kimi-k2-instruct è disponibile viene posto in prima posizione
+        (miglior modello per PDF reading). Altrimenti la lista è restituita invariata.
+        """
         api_key = api_key or os.getenv("GROQ_API_KEY")
         if not api_key:
             return AIProvider.GROQ_MODELS or []
@@ -588,8 +596,13 @@ class AIProvider:
                 data = response.json()
                 # Extract model IDs
                 models = [m["id"] for m in data.get("data", [])]
-                # Filter/Sort if needed (e.g., prioritize llama-3)
-                return sorted(models)
+                sorted_models = sorted(models)
+                # Prioritize preferred PDF model if available
+                preferred = AIProvider.PREFERRED_GROQ_MODEL
+                if preferred in sorted_models:
+                    sorted_models.remove(preferred)
+                    sorted_models.insert(0, preferred)
+                return sorted_models
             else:
                 print(f"⚠️ Groq API Error {response.status_code}: {response.text}")
                 return AIProvider.GROQ_MODELS
