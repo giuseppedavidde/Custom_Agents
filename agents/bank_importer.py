@@ -21,10 +21,10 @@ class BankImporter:
 
     def _clean_amount(self, amount_str):
         """Converts German format (1.234,56) to float (1234.56)."""
-        if isinstance(amount_str, (int, float)):
-            return float(amount_str)
         if pd.isna(amount_str) or amount_str == "":
             return 0.0
+        if isinstance(amount_str, (int, float)):
+            return float(amount_str)
         
         # Remove thousands separator (.), replace decimal separator (,)
         clean = str(amount_str).replace('.', '')
@@ -35,24 +35,88 @@ class BankImporter:
             return 0.0
 
     def _load_csv(self, file_buffer):
-        """Loads CSV from buffer trying different encodings."""
-        try:
-            # Try latin1 first for German bank exports
-            df = pd.read_csv(file_buffer, sep=';', encoding='latin1')
-            return df
-        except UnicodeDecodeError:
-            file_buffer.seek(0)
+        """Loads CSV from buffer trying different encodings and separators."""
+        # Try different encodings
+        encodings = ['latin1', 'cp1252', 'utf-8']
+        
+        for enc in encodings:
             try:
-                # Fallback to cp1252
-                df = pd.read_csv(file_buffer, sep=';', encoding='cp1252')
-                return df
-            except Exception:
                 file_buffer.seek(0)
-                # Fallback to utf-8 just in case
-                df = pd.read_csv(file_buffer, sep=';', encoding='utf-8')
+                # First try semicolon
+                df = pd.read_csv(file_buffer, sep=';', encoding=enc)
+                if len(df.columns) <= 1:
+                    # If only 1 column was found, it's likely a comma separated file
+                    file_buffer.seek(0)
+                    df = pd.read_csv(file_buffer, sep=',', encoding=enc)
                 return df
-        except Exception as e:
-            raise Exception(f"Failed to read CSV: {e}")
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                # Other exceptions like parsing errors, try next encoding just in case, but usually it fails
+                pass
+                
+        raise Exception("Failed to read CSV with supported encodings (latin1, cp1252, utf-8)")
+
+    def _standardize_columns(self, df):
+        """Identifies key columns and creates standardized columns for internal use."""
+        # Create a lowercase mapping of the columns
+        lower_cols = {str(col).lower(): col for col in df.columns}
+        
+        amount_aliases = ['betrag', 'amount', 'importo', 'value', 'importo in eur']
+        date_aliases = ['buchungsdatum', 'date', 'data', 'valuta', 'datetime', 'data contabile']
+        desc_aliases = ['umsatztext', 'buchungstext', 'description', 'descrizione', 'causale', 'name', 'payment_reference', 'name des partners', 'counterparty_name', 'descrizione operazione']
+        cat_aliases = ['kategorie', 'category', 'categoria']
+
+        # 1. Amount
+        df['Std_Amount'] = 0
+        for alias in amount_aliases:
+            if alias in lower_cols:
+                df['Std_Amount'] = df[lower_cols[alias]]
+                break
+
+        # 1.5 Taxes and Fees
+        tax_aliases = ['tax', 'tassa', 'steuer', 'imposta']
+        fee_aliases = ['fee', 'commissione', 'gebühr', 'commission']
+
+        df['Std_Tax'] = 0
+        for alias in tax_aliases:
+            if alias in lower_cols:
+                df['Std_Tax'] = df[lower_cols[alias]]
+                break
+                
+        df['Std_Fee'] = 0
+        for alias in fee_aliases:
+            if alias in lower_cols:
+                df['Std_Fee'] = df[lower_cols[alias]]
+                break
+
+        # 2. Date
+        df['Std_Date'] = ''
+        for alias in date_aliases:
+            if alias in lower_cols:
+                df['Std_Date'] = df[lower_cols[alias]]
+                break
+
+        # 3. Category
+        df['Std_Category'] = 'Da Categorizzare'
+        for alias in cat_aliases:
+            if alias in lower_cols:
+                df['Std_Category'] = df[lower_cols[alias]]
+                break
+
+        # 4. Description (Concatenate all matching description columns)
+        desc_parts = []
+        for alias in desc_aliases:
+            if alias in lower_cols:
+                desc_parts.append(df[lower_cols[alias]].fillna('').astype(str))
+        
+        if desc_parts:
+            # Concatenate them into a single string separated by space
+            df['Std_Description'] = pd.concat(desc_parts, axis=1).agg(' '.join, axis=1).str.strip()
+        else:
+            df['Std_Description'] = ''
+            
+        return df
 
     def process_file(self, file_buffer, target_categories, income_cols, progress_callback=None):
         """
@@ -92,21 +156,21 @@ class BankImporter:
         if df is None or df.empty:
             raise ValueError("File is empty or could not be read.")
 
+        # 1.5 Standardize Columns
+        df = self._standardize_columns(df)
+
         # 2. Prepare for AI Categorization
         model = self.ai_provider.get_model(json_mode=True)
         mappings = {}
         
         # Keep original category for comparison (if present, else empty)
-        if 'Kategorie' not in df.columns:
-            df['Kategorie'] = 'Da Categorizzare'
-            
-        df['Analyzed_Category'] = df['Kategorie'] 
+        df['Analyzed_Category'] = df['Std_Category'] 
 
         items_to_process = []
         for index, row in df.iterrows():
-            desc = f"{row.get('Umsatztext', '')} {row.get('Buchungstext', '')} {row.get('Name des Partners', '')}".strip()
-            amount = row.get('Betrag', '0')
-            old_cat = row.get('Kategorie', '')
+            desc = row.get('Std_Description', '')
+            amount = row.get('Std_Amount', '0')
+            old_cat = row.get('Std_Category', '')
             
             items_to_process.append({
                 "id": index,
@@ -187,13 +251,33 @@ class BankImporter:
                 df.at[idx, 'New_Category'] = new_cat
 
         # 5. Clean Data for Aggregation
-        df['Betrag_Float'] = df['Betrag'].apply(self._clean_amount)
+        df['Betrag_Float'] = df['Std_Amount'].apply(self._clean_amount)
+        
+        if 'Std_Fee' in df.columns:
+            df['Fee_Float'] = df['Std_Fee'].apply(self._clean_amount)
+        else:
+            df['Fee_Float'] = 0.0
+            
+        if 'Std_Tax' in df.columns:
+            df['Tax_Float'] = df['Std_Tax'].apply(self._clean_amount)
+        else:
+            df['Tax_Float'] = 0.0
+            
+        # Algebraic sum: if amount is positive and tax is negative, it reduces the net amount
+        # If amount is negative and fee is negative, it increases the total expense
+        df['Betrag_Float'] = df['Betrag_Float'] + df['Fee_Float'] + df['Tax_Float']
 
         # Parse Dates
-        try:
-            df['DateObj'] = pd.to_datetime(df['Buchungsdatum'], format='%d/%m/%Y')
-        except Exception:
-            df['DateObj'] = pd.to_datetime(df['Buchungsdatum'], dayfirst=True, errors='coerce')
+        df['DateObj'] = pd.to_datetime(df['Std_Date'], format='%d/%m/%Y', errors='coerce')
+        mask = df['DateObj'].isna()
+        if mask.any():
+            df.loc[mask, 'DateObj'] = pd.to_datetime(df.loc[mask, 'Std_Date'], format='%Y-%m-%d', errors='coerce')
+        mask = df['DateObj'].isna()
+        if mask.any():
+            try:
+                df.loc[mask, 'DateObj'] = pd.to_datetime(df.loc[mask, 'Std_Date'], format='mixed', dayfirst=True, errors='coerce')
+            except Exception:
+                df.loc[mask, 'DateObj'] = pd.to_datetime(df.loc[mask, 'Std_Date'], errors='coerce')
 
         df['Year'] = df['DateObj'].dt.year
         df['MonthNum'] = df['DateObj'].dt.month
@@ -269,11 +353,11 @@ class BankImporter:
         md += "|---|---|---|---|---|\n"
         
         for idx, row in df.iterrows():
-            desc = f"{row.get('Umsatztext', '')} {row.get('Name des Partners', '')}".strip()[:40]
+            desc = str(row.get('Std_Description', ''))[:40]
             old = row.get('Analyzed_Category', '')
             new = row.get('New_Category', '')
             amt = row.get('Betrag_Float', 0)
-            date = str(row.get('Buchungsdatum', ''))
+            date = str(row.get('Std_Date', ''))
             
             # Formatting
             desc = desc.replace("|", "-") # Avoid breaking MD table
