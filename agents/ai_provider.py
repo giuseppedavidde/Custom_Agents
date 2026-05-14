@@ -7,6 +7,8 @@ import random
 import re
 import ollama
 import requests
+import subprocess
+import glob
 from bs4 import BeautifulSoup
 
 from google import genai
@@ -442,6 +444,163 @@ class PuterWrapper:
             yield f"❌ Errore Puter/Claude Stream: {e}"
 
 
+class OpenRouterWrapper:
+    """Wrapper per OpenRouter OpenAI-compatible API."""
+
+    OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+    def __init__(self, provider, model_name: str, json_mode: bool = False):
+        self.provider = provider
+        # Fallback to a common model if none provided
+        self.model_name = model_name or "anthropic/claude-3.5-sonnet"
+        self.json_mode = json_mode
+        if not OPENAI_AVAILABLE:
+            raise ImportError("Libreria 'openai' non installata. Esegui: pip install openai")
+        
+        self.client = openai_lib.OpenAI(
+            base_url=self.OPENROUTER_BASE_URL,
+            api_key=self.provider.api_key,
+            default_headers={
+                "HTTP-Referer": "https://github.com/giuseppe/antigravity",
+                "X-OpenRouter-Title": "Antigravity Local Engine"
+            }
+        )
+
+    def _build_messages(self, prompt: Any) -> list:
+        content, images = process_multimodal_input(prompt, self.model_name)
+        if images:
+            content += "\n[Note: Image attachments currently simplified in OpenRouter wrapper]\n"
+        return [{"role": "user", "content": content}]
+
+    def generate_content(self, prompt: Any):
+        try:
+            messages = self._build_messages(prompt)
+            kwargs = {
+                "model": self.model_name,
+                "messages": messages,
+            }
+            if self.json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+
+            response = self.client.chat.completions.create(**kwargs)
+
+            class Response:
+                def __init__(self, text):
+                    self.text = text
+
+            return Response(response.choices[0].message.content)
+        except Exception as e:
+            raise RuntimeError(f"OpenRouter Error: {e}") from e
+
+    def generate_stream(self, prompt: Any):
+        try:
+            messages = self._build_messages(prompt)
+            stream = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta is not None:
+                    yield delta
+        except Exception as e:
+            yield f"❌ Errore OpenRouter Stream: {e}"
+
+
+class LlamaCppWrapper:
+    """Wrapper per llama.cpp server (OpenAI-compatible API)."""
+
+    def __init__(self, model_name: str, host: str = "localhost", port: int = 8080, json_mode: bool = False):
+        self.model_name = model_name
+        self.host = host
+        self.port = port
+        self.json_mode = json_mode
+        self.base_url = f"http://{host}:{port}/v1"
+        if not OPENAI_AVAILABLE:
+            raise ImportError("Libreria 'openai' non installata. Esegui: pip install openai")
+        self.client = openai_lib.OpenAI(
+            base_url=self.base_url,
+            api_key="no-key",  # llama-server non richiede API key
+        )
+
+    def generate_content(self, prompt: Any):
+        """Genera contenuto usando llama-server."""
+        try:
+            content, images = process_multimodal_input(prompt, self.model_name)
+
+            if images:
+                content += "\n[Note: Image attachments are not supported via llama.cpp server]\n"
+
+            messages = [{"role": "user", "content": content}]
+            kwargs = {
+                "model": self.model_name,
+                "messages": messages,
+            }
+            if self.json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+
+            print(f"⏳ LlamaCpp: Invio richiesta a {self.model_name} ({self.base_url})...")
+            start_t = time.time()
+
+            response = self.client.chat.completions.create(**kwargs)
+
+            duration = time.time() - start_t
+            result_text = response.choices[0].message.content
+
+            # Extract token usage from llama-server response
+            usage = getattr(response, "usage", None)
+            completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+            total_tokens = getattr(usage, "total_tokens", 0) or 0
+            tokens_per_sec = completion_tokens / duration if duration > 0 else 0
+
+            print(
+                f"✅ LlamaCpp: {len(result_text)} chars | "
+                f"{completion_tokens} tokens out / {total_tokens} tot | "
+                f"{tokens_per_sec:.1f} t/s | {duration:.2f}s"
+            )
+
+            class Response:
+                def __init__(self, text, _completion_tokens, _total_tokens, _tps, _duration):
+                    self.text = text
+                    self.completion_tokens = _completion_tokens
+                    self.total_tokens = _total_tokens
+                    self.tokens_per_sec = _tps
+                    self.duration_sec = _duration
+
+            return Response(result_text, completion_tokens, total_tokens, tokens_per_sec, duration)
+
+        except Exception as e:
+            raise RuntimeError(f"LlamaCpp Error: {e}") from e
+
+    def generate_stream(self, prompt: Any):
+        """Genera in streaming usando llama-server."""
+        try:
+            content, images = process_multimodal_input(prompt, self.model_name)
+
+            if images:
+                content += "\n[Note: Image attachments are not supported via llama.cpp server]\n"
+
+            messages = [{"role": "user", "content": content}]
+            kwargs = {
+                "model": self.model_name,
+                "messages": messages,
+                "stream": True,
+            }
+            if self.json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+
+            stream = self.client.chat.completions.create(**kwargs)
+
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta is not None:
+                    yield delta
+
+        except Exception as e:
+            yield f"❌ Errore LlamaCpp Stream: {e}"
+
+
 class AIProvider:
     """Factory per modelli AI (Cloud/Local) con Caching."""
 
@@ -489,6 +648,63 @@ class AIProvider:
 
     PUTER_BASE_URL = "https://api.puter.com/puterai/openai/v1/"
 
+    LLAMACPP_HOST = "localhost"
+    LLAMACPP_PORT = 8080
+    LLAMACPP_SERVER_SCRIPT = os.path.expanduser(
+        "~/Progetti/llama_turboquant/start_server.fish"
+    )
+    LLAMACPP_MODELS_DIR = os.path.expanduser(
+        "~/Progetti/llama_turboquant/models"
+    )
+
+    @staticmethod
+    def is_llamacpp_running() -> bool:
+        """Verifica se il processo llama-server è in esecuzione."""
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "llama-server"],
+                capture_output=True, timeout=3,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def get_local_llamacpp_models() -> List[str]:
+        """Recupera la lista dei file .gguf presenti nella cartella modelli locale."""
+        if not os.path.exists(AIProvider.LLAMACPP_MODELS_DIR):
+            return []
+        model_files = glob.glob(os.path.join(AIProvider.LLAMACPP_MODELS_DIR, "*.gguf"))
+        return sorted([os.path.basename(m) for m in model_files])
+
+    @staticmethod
+    def start_llamacpp_server(model_filename: str = "", thinking_mode: str = "") -> int:
+        """
+        Avvia il server LlamaCpp in background.
+        Restituisce il PID del processo.
+        """
+        env = os.environ.copy()
+        env["GGML_CUDA_ENABLE_UNIFIED_MEMORY"] = "1"
+        env["HSA_OVERRIDE_GFX_VERSION"] = "11.0.3"
+        if model_filename:
+            env["LLAMA_MODEL_FILENAME"] = model_filename
+        if thinking_mode:
+            env["LLAMA_THINKING_MODE"] = thinking_mode
+            
+        proc = subprocess.Popen(
+            ["fish", AIProvider.LLAMACPP_SERVER_SCRIPT],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+        return proc.pid
+
+    @staticmethod
+    def stop_llamacpp_server() -> None:
+        """Termina il server LlamaCpp."""
+        subprocess.run(["pkill", "-f", "llama-server"], timeout=5)
+
     _cached_chain: Optional[List[str]] = None
     _last_scrape_time: float = 0
 
@@ -510,6 +726,8 @@ class AIProvider:
             self.api_key = api_key or os.getenv("GROQ_API_KEY")
         elif self.provider_type == "puter":
             self.api_key = api_key or os.getenv("PUTER_API_KEY")
+        elif self.provider_type == "openrouter":
+            self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         else:
             self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
 
@@ -568,10 +786,43 @@ class AIProvider:
                 f"🤖 AI Provider impostato su Puter/Claude: {self.current_model_name}"
             )
 
+        elif self.provider_type == "openrouter":
+            if not OPENAI_AVAILABLE:
+                raise ImportError(
+                    "Libreria 'openai' non installata. Esegui: pip install openai"
+                )
+            # For OpenRouter, api_key holds the OpenRouter auth token
+            self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+            if not self.api_key:
+                print("⚠️ OPENROUTER_API_KEY mancante. Inserisci il token OpenRouter.")
+            self.current_model_name = self.target_model or "anthropic/claude-3.5-sonnet"
+            self.log_debug(
+                f"🤖 AI Provider impostato su OpenRouter: {self.current_model_name}"
+            )
+
+        elif self.provider_type == "llamacpp":
+            if not OPENAI_AVAILABLE:
+                raise ImportError(
+                    "Libreria 'openai' non installata. Esegui: pip install openai"
+                )
+            # Recupera il primo modello disponibile dal server
+            models = self.get_llamacpp_models()
+            self.current_model_name = self.target_model or (models[0] if models else "default")
+            self.log_debug(
+                f"🤖 AI Provider impostato su LlamaCpp: {self.current_model_name}"
+            )
+
     @staticmethod
     def get_supported_providers() -> List[str]:
-        """Restituisce la lista dei provider supportati."""
-        return ["Gemini", "Groq", "Ollama", "Puter"]
+        """Restituisce la lista dei provider supportati.
+
+        LlamaCpp viene incluso se lo script del server è presente su disco,
+        indipendentemente dal fatto che il server sia in esecuzione.
+        """
+        providers = ["Gemini", "Groq", "Ollama", "Puter", "OpenRouter"]
+        if os.path.isfile(AIProvider.LLAMACPP_SERVER_SCRIPT):
+            providers.append("LlamaCpp")
+        return providers
 
     @staticmethod
     def get_groq_models(api_key: Optional[str] = None) -> List[str]:
@@ -647,6 +898,58 @@ class AIProvider:
         """Restituisce la lista dei modelli AI (Claude/Gemini) disponibili via Puter."""
         return list(AIProvider.PUTER_MODELS)
 
+    @staticmethod
+    def get_openrouter_models(api_key: Optional[str] = None) -> List[str]:
+        """Recupera la lista dei modelli OpenRouter via API."""
+        api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            return ["anthropic/claude-3.5-sonnet", "openai/gpt-4o", "google/gemini-pro-1.5"]
+        
+        url = "https://openrouter.ai/api/v1/models"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+        }
+        
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                models = [m["id"] for m in data.get("data", [])]
+                # Default list on top
+                defaults = ["anthropic/claude-3.7-sonnet", "openai/gpt-4o", "google/gemini-2.5-flash"]
+                available_defaults = [m for m in defaults if m in models]
+                others = sorted([m for m in models if m not in defaults])
+                return available_defaults + others
+            else:
+                return ["anthropic/claude-3.5-sonnet", "openai/gpt-4o", "google/gemini-pro-1.5"]
+        except Exception:
+            return ["anthropic/claude-3.5-sonnet", "openai/gpt-4o", "google/gemini-pro-1.5"]
+
+    @staticmethod
+    def detect_llamacpp(host: str = None, port: int = None) -> bool:
+        """Verifica se llama-server è raggiungibile."""
+        host = host or AIProvider.LLAMACPP_HOST
+        port = port or AIProvider.LLAMACPP_PORT
+        try:
+            r = requests.get(f"http://{host}:{port}/health", timeout=2)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    @staticmethod
+    def get_llamacpp_models(host: str = None, port: int = None) -> List[str]:
+        """Recupera i modelli caricati da llama-server /v1/models."""
+        host = host or AIProvider.LLAMACPP_HOST
+        port = port or AIProvider.LLAMACPP_PORT
+        try:
+            r = requests.get(f"http://{host}:{port}/v1/models", timeout=3)
+            if r.status_code == 200:
+                data = r.json()
+                return [m["id"] for m in data.get("data", [])]
+        except Exception as e:
+            print(f"⚠️ Error fetching LlamaCpp models: {e}")
+        return []
+
     def log_debug(self, message: str):
         """Log di debug se abilitato."""
         if self.debug_mode:
@@ -660,6 +963,15 @@ class AIProvider:
             return GroqWrapper(self, self.current_model_name, json_mode)
         elif self.provider_type == "puter":
             return PuterWrapper(self, self.current_model_name, json_mode)
+        elif self.provider_type == "openrouter":
+            return OpenRouterWrapper(self, self.current_model_name, json_mode)
+        elif self.provider_type == "llamacpp":
+            return LlamaCppWrapper(
+                self.current_model_name,
+                host=self.LLAMACPP_HOST,
+                port=self.LLAMACPP_PORT,
+                json_mode=json_mode,
+            )
         return GeminiWrapper(self, json_mode)
 
     def _init_gemini_chain(self):
@@ -687,6 +999,171 @@ class AIProvider:
         # Fallback finale se tutto fallisce
         if not self.available_models_chain:
             self.available_models_chain = self.FALLBACK_ORDER
+
+    @staticmethod
+    def render_streamlit_sidebar() -> Tuple[str, Optional[str]]:
+        """
+        Rende l'interfaccia utente (UI) per la selezione del provider e del modello AI
+        nella sidebar di Streamlit. 
+        
+        Questa funzione è l'unico punto di verità per aggiungere nuovi provider,
+        in modo che i frontend (come ibkr_trading.py) non debbano essere aggiornati.
+
+        Ritorna:
+            Tuple[str, Optional[str]]: (provider_selezionato, modello_selezionato)
+        """
+        import streamlit as st
+
+        st.sidebar.title("AI Model")
+        supported_providers = AIProvider.get_supported_providers()
+        
+        # Selezione Provider
+        ai_provider = st.sidebar.selectbox(
+            "Provider",
+            supported_providers,
+            format_func=lambda x: (
+                "☁️ Gemini (Cloud)" if x.lower() == "gemini"
+                else "🖥️ Ollama (Local)" if x.lower() == "ollama"
+                else "⚡ Groq (LPU Cloud)" if x.lower() == "groq"
+                else "🧠 Claude (Puter Free)" if x.lower() == "puter"
+                else "🌐 OpenRouter (Unified API)" if x.lower() == "openrouter"
+                else "🦙 LlamaCpp (TurboQuant)" if x.lower() == "llamacpp"
+                else x
+            ),
+        )
+        ai_provider = ai_provider.lower()
+        ai_model_name = None
+
+        if ai_provider == "ollama":
+            ollama_models = AIProvider.get_ollama_models()
+            if ollama_models:
+                ai_model_name = st.sidebar.selectbox("Model", ollama_models)
+            else:
+                st.sidebar.warning("No Ollama models found. Is Ollama running?")
+                
+        elif ai_provider == "openrouter":
+            api_key = os.getenv("OPENROUTER_API_KEY")
+            if not api_key:
+                api_key = st.sidebar.text_input("OpenRouter API Key", type="password")
+                if api_key:
+                    os.environ["OPENROUTER_API_KEY"] = api_key
+
+            if not os.getenv("OPENROUTER_API_KEY"):
+                st.sidebar.warning("🔑 OpenRouter API Key required.")
+            else:
+                openrouter_models = AIProvider.get_openrouter_models()
+                ai_model_name = st.sidebar.selectbox("Model", openrouter_models)
+
+        elif ai_provider == "llamacpp":
+            _lcpp_script = AIProvider.LLAMACPP_SERVER_SCRIPT
+            _lcpp_script_exists = os.path.isfile(_lcpp_script)
+            _lcpp_running = AIProvider.is_llamacpp_running()
+
+            if _lcpp_running:
+                st.sidebar.markdown("**LlamaCpp Server:** 🟢 Running")
+            else:
+                st.sidebar.markdown("**LlamaCpp Server:** ⚫ Not running")
+
+            if not _lcpp_running and _lcpp_script_exists:
+                st.sidebar.markdown("**Server Settings**")
+                _model_names = AIProvider.get_local_llamacpp_models()
+                if _model_names:
+                    st.sidebar.selectbox("LlamaCpp Model", _model_names, key="lcpp_model_sel")
+                    st.sidebar.selectbox("Thinking Mode", ["1", "2"], format_func=lambda x: "ON (Reasoning)" if x == "1" else "OFF (Fast Instruct)", key="lcpp_think_sel")
+                else:
+                    st.sidebar.caption("⚠️ Nessun file .gguf trovato nella cartella modelli.")
+
+            _lcpp_col1, _lcpp_col2 = st.sidebar.columns(2)
+            with _lcpp_col1:
+                if st.button("🚀 Start Server", key="lcpp_start", disabled=not _lcpp_script_exists or _lcpp_running):
+                    try:
+                        model = st.session_state.get("lcpp_model_sel", "")
+                        thinking = st.session_state.get("lcpp_think_sel", "")
+                        pid = AIProvider.start_llamacpp_server(model, thinking)
+                        st.session_state["_lcpp_pid"] = pid
+                        st.toast(f"LlamaCpp server launched (PID {pid}). Loading model...", icon="🦙")
+                        import time as _time
+                        _time.sleep(2)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to launch llama-server: {e}")
+            with _lcpp_col2:
+                if st.button("⏹️ Stop Server", key="lcpp_stop", disabled=not _lcpp_running):
+                    try:
+                        AIProvider.stop_llamacpp_server()
+                        st.session_state.pop("_lcpp_pid", None)
+                        st.toast("LlamaCpp server stopped.", icon="⏹️")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to stop llama-server: {e}")
+
+            if not _lcpp_script_exists:
+                st.sidebar.caption(f"⚠️ Server script not found: `{_lcpp_script}`")
+
+            if _lcpp_running and AIProvider.detect_llamacpp():
+                lcpp_models = AIProvider.get_llamacpp_models()
+                if lcpp_models:
+                    ai_model_name = st.sidebar.selectbox("Model", lcpp_models)
+                else:
+                    st.sidebar.info("⏳ Server is starting, model loading...")
+            else:
+                if not _lcpp_running:
+                    st.sidebar.info("Start the server to use LlamaCpp.")
+
+        elif ai_provider == "groq":
+            api_key = os.getenv("GROQ_API_KEY")
+            if not api_key:
+                api_key = st.sidebar.text_input("Groq API Key", type="password")
+                if api_key:
+                    os.environ["GROQ_API_KEY"] = api_key
+
+            if not os.getenv("GROQ_API_KEY"):
+                st.sidebar.warning("🔑 Groq API Key required.")
+            else:
+                try:
+                    groq_models = AIProvider.get_groq_models(api_key=os.getenv("GROQ_API_KEY"))
+                except Exception as e:
+                    st.sidebar.error(f"Debug Info: {e}")
+                    print(f"Error fetching Groq models: {e}")
+                    groq_models = []
+
+                if not groq_models:
+                    st.sidebar.error("❌ Could not fetch Groq models. Check API Key.")
+                else:
+                    ai_model_name = st.sidebar.selectbox("Model", groq_models)
+
+        elif ai_provider == "puter":
+            puter_key = os.getenv("PUTER_API_KEY")
+            if not puter_key:
+                puter_key = st.sidebar.text_input(
+                    "Puter Auth Token",
+                    type="password",
+                    help="Get your token from puter.com → Settings. Stored as PUTER_API_KEY env var.",
+                )
+                if puter_key:
+                    os.environ["PUTER_API_KEY"] = puter_key
+
+            if not os.getenv("PUTER_API_KEY"):
+                st.sidebar.warning("🔑 Puter Auth Token required. Get it from puter.com.")
+            else:
+                puter_models = AIProvider.get_puter_models()
+                ai_model_name = st.sidebar.selectbox("Claude Model", puter_models)
+
+        else:
+            # Gemini
+            try:
+                gemini_models = AIProvider.get_gemini_models()
+            except Exception as e:
+                st.sidebar.error(f"Debug Info: {e}")
+                print(f"Error fetching Gemini models: {e}")
+                gemini_models = AIProvider.FALLBACK_ORDER
+
+            if not gemini_models:
+                st.sidebar.error("❌ Could not fetch Gemini models.")
+            else:
+                ai_model_name = st.sidebar.selectbox("Model", gemini_models)
+
+        return ai_provider, ai_model_name
 
         self.current_model_index = 0
         self.current_model_name = self.available_models_chain[0]

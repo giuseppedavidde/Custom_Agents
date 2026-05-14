@@ -5,6 +5,7 @@ agents/ai_provider.py
 agents/bank_importer.py
 agents/cloud_manager.py
 agents/cloud_ui.py
+agents/recipe_researcher.py
 agents/trader_agent.py
 custom_agents.egg-info/PKG-INFO
 custom_agents.egg-info/SOURCES.txt
