@@ -4,6 +4,21 @@ L'approccio si concentra sulla scomposizione di payoff, esposizione alle greche 
 
 ---
 
+### Framework di Selezione del Trade: Direction, Duration, Magnitude
+
+Prima di costruire qualsiasi strategia, Fontanills stabilisce 3 dimensioni fondamentali per filtrare l'operatività:
+
+1. **Direction (Direzione)**: Identificare la tendenza del sottostante tramite analisi tecnica (trendlines, medie mobili, momentum > 20% giornaliero).
+2. **Duration (Durata)**: Quanto tempo si prevede che il movimento impieghi a svilupparsi. Determina la scelta della scadenza — regola del **90/30**: comprare opzioni con ≥ 90 giorni alla scadenza, non detenere oltre 30 giorni.
+3. **Magnitude (Magnitudo)**: Quanto si prevede che il sottostante si muova. Determina la scelta dello strike (delta target: ~50 per ATM, ~90 per deep ITM stock replacement).
+
+Questo framework permette di distinguere tra:
+- **Trade direzionali** (Long Call/Put, Vertical Spreads) — scommettono su direzione chiara.
+- **Trade di volatilità** (Straddle, Strangle) — scommettono su magnitudo senza direzione.
+- **Trade di tempo** (Calendar Spread, Short options) — scommettono su durata/decadimento.
+
+---
+
 ### 1. STRATEGIE DIREZIONALI BASE
 
 Queste strategie forniscono un'esposizione lineare e direzionale con rischio predefinito.
@@ -18,6 +33,12 @@ Queste strategie forniscono un'esposizione lineare e direzionale con rischio pre
 *   **Esempio Matematico 1:** 
     *   *Setup:* Acquisto di 1 contratto September IBM 105 Call a un premio di 5.
     *   *Calcoli:* Max Loss = $500 (5 x 100) più commissioni. Se a scadenza IBM è a 115, il profitto lordo sarà [(115 - 105) - 5] x 100 = $500. Il breakeven è a $110 (105 + 5).
+
+**Long Call con LEAPS (Stock Replacement)**
+*   **1) Definizione e Setup:** Acquisto di opzioni Long-term Equity AnticiPation Securities (LEAPS) Deep ITM con Delta ≥ 90 invece di possedere 100 azioni del sottostante.
+*   **2) Condizioni di mercato ideali:** Trend rialzista di lungo periodo in cui si vuole replicare l'esposizione all'azione impiegando meno capitale.
+*   **3) Vantaggi:** Leva finanziaria (minor capitale immobilizzato), theta ridotto rispetto a opzioni a breve termine, nessun margin requirement come la vendita allo scoperto.
+*   **4) Rischi:** Il decadimento temporale esiste comunque (sebbene più lento), e il Delta < 100 significa performance non perfettamente allineata con l'azione.
 
 ---
 
@@ -144,7 +165,22 @@ Sfruttano il decadimento temporale (Theta) e la contrazione della volatilità, m
     *   *Breakeven:* Upside = Short Call Strike + Net Credit; Downside = Short Put Strike - Net Credit.
 *   **Esempio Matematico 11:**
     *   *Setup:* Long 1 EBAY Jan 75 Call @ 2.50; Short 1 EBAY Jan 70 Call @ 5.00; Short 1 EBAY Jan 65 Put @ 2.00; Long 1 EBAY Jan 60 Put @ 1.00.
-    *   *Calcoli:* Net Credit = [(5 + 2) - (2.50 + 1)] x 100 = $350. Max Reward = $350. Max Loss = [(75 - 70) - 3.50] x 100 = $150. Upside Breakeven = 73.50 (70 + 3.50). Downside Breakeven = 61.50 (65 - 3.50).
+     *   *Calcoli:* Net Credit = [(5 + 2) - (2.50 + 1)] x 100 = $350. Max Reward = $350. Max Loss = [(75 - 70) - 3.50] x 100 = $150. Upside Breakeven = 73.50 (70 + 3.50). Downside Breakeven = 61.50 (65 - 3.50).
+
+**Iron Condor**
+*   **1) Definizione e Setup:** Combinazione di un Bull Put Spread (Put venduta OTM + Put long protettiva più lontana) e un Bear Call Spread (Call venduta OTM + Call long protettiva più lontana). Quattro strike totali — posizione a credito netto.
+*   **2) Condizioni di mercato ideali:** Mercato laterale con volatilità implicita alta da vendere. Profitta dalla contrazione della volatilità e dal decadimento temporale. Più indulgente dell'Iron Butterfly grazie a "ali" più larghe.
+*   **3) Calcolo del rischio:**
+    *   *Max Profit:* Limitato al Net Credit incassato.
+    *   *Max Loss:* [(Differenza tra gli strike short e long di un lato) - Net Credit] x 100.
+    *   *Breakeven:* Upside = Short Call Strike + Net Credit; Downside = Short Put Strike - Net Credit.
+*   **4) Gestione:**
+    *   *Take Profit:* Decadimento temporale riduce il valore delle opzioni verso zero.
+    *   *Stop Loss:* Sottostante supera uno dei breakeven point.
+    *   *Aggiustamento:* Se un lato è minacciato, rollare lo spread minacciato (up o down) e out nel tempo.
+*   **Esempio Matematico 14:**
+    *   *Setup:* Sottostante a $100. Short 1 Put 95 @ 2.00; Long 1 Put 90 @ 1.00; Short 1 Call 105 @ 2.00; Long 1 Call 110 @ 1.00.
+    *   *Calcoli:* Net Credit = [(2.00 + 2.00) - (1.00 + 1.00)] x 100 = $200. Max Reward = $200. Max Loss = [(95 - 90) - 2.00] x 100 = $300. Upside Breakeven = 107 (105 + 2.00). Downside Breakeven = 93 (95 - 2.00).
 
 ---
 
@@ -238,7 +274,8 @@ Le fonti forniscono regole molto rigorose basate sulle Greche e sulla Volatilit�
 *   **Ritorno alla Media (Mean Reversion):** La volatilità implicita si comporta come un elastico: raggiunge estremi ma tende sempre a tornare verso il suo livello medio.
 *   **Quando Comprare:** Le opzioni lunghe (long calls/long puts) vanno acquistate quando l'IV è **storicamente bassa**, anticipando un'esplosione di volatilità che farà aumentare il premio indipendentemente dalla direzione,.
 *   **Quando Vendere:** Le opzioni vanno vendute (creando strategie a credito) quando l'IV è **molto alta**, speculando su una sua contrazione.
-*   **Evitare il "Volatility Crush":** Non comprare mai opzioni subito prima di un annuncio atteso (es. utili aziendali) se l'IV è già salita alle stelle. Dopo l'annuncio, la volatilità crollerà (volatility crush) e l'opzione perderà valore drammaticamente, causando perdite anche se si è indovinata la direzione del prezzo. 
+*   **Evitare il "Volatility Crush":** Non comprare mai opzioni subito prima di un annuncio atteso (es. utili aziendali) se l'IV è già salita alle stelle. Dopo l'annuncio, la volatilità crollerà (volatility crush) e l'opzione perderà valore drammaticamente, causando perdite anche se si è indovinata la direzione del prezzo.
+*   **Contesto 0DTE (Zero Days to Expiration):** L'esplosione del trading di opzioni 0DTE (prevalentemente retail con bias rialzista) crea un meccanismo di hedging forzato da parte dei market maker. Per neutralizzare il Gamma exposure, i dealer sono costretti a "piazzare" (hedge) i prezzi a determinati livelli, generando anomalie volume-prezzo (es. Sumo Candle). Questo fenomeno rende il Vanna (sensibilità della volatilità al prezzo) e il Charm (derivata del Delta rispetto al tempo) greche critiche da monitorare in scadenze intraday.
 
 ### 3. Parametri Numerici Ideali per l'Ingresso a Mercato
 

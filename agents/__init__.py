@@ -4,6 +4,8 @@ from .cloud_ui import render_cloud_sync_ui
 from .bank_importer import BankImporter
 from .trader_agent import TraderAgent
 from .recipe_researcher import RecipeResearcher
+from .opencode_agent import OpencodeAgent, OpencodeConfig, OpencodeResult
+from .opencode_debate import OpencodeDebate, DebateRound, DebateRecord, DebateHistory
 
 __all__ = [
     "AIProvider",
@@ -12,4 +14,11 @@ __all__ = [
     "BankImporter",
     "TraderAgent",
     "RecipeResearcher",
+    "OpencodeAgent",
+    "OpencodeConfig",
+    "OpencodeResult",
+    "OpencodeDebate",
+    "DebateRound",
+    "DebateRecord",
+    "DebateHistory",
 ]

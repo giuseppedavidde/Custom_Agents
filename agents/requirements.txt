@@ -9,3 +9,4 @@ PyGithub
 google-api-core
 groq
 openai
+opencode-ai
