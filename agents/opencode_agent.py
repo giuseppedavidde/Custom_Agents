@@ -5,15 +5,17 @@ from __future__ import annotations
 import json
 import os
 import queue
-import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Iterator, Optional
 
 from pydantic import BaseModel, Field
+
+from .knowledge_loader import load_all_knowledge as _load_all_wiki
 
 
 class OpencodeConfig(BaseModel):
@@ -33,28 +35,10 @@ class OpencodeResult(BaseModel):
     error: Optional[str] = None
 
 
-KNOWLEDGE_DIR = os.path.join(os.path.dirname(__file__), "knowledge")
-
-
-def load_kb_file(filename: str) -> str:
-    """Load a single knowledge markdown file."""
-    kb_path = os.path.join(KNOWLEDGE_DIR, filename)
-    try:
-        with open(kb_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        content = re.sub(r"\n\s*\n", "\n", content)
-        content = re.sub(r"\*\*|\*|---", "", content)
-        return content.strip()
-    except FileNotFoundError:
-        return ""
-
 
 def load_all_knowledge() -> dict[str, str]:
-    """Load all knowledge bases into a dict keyed by domain."""
-    return {
-        "options": load_kb_file("fontanills_options_knowledge.md"),
-        "vpa": load_kb_file("coulling_volman_knowledge.md"),
-    }
+    """Load all knowledge bases from the LLM_Wiki/Trading_Wiki."""
+    return _load_all_wiki()
 
 
 _MODEL_CACHE: list[str] | None = None
@@ -107,7 +91,11 @@ class OpencodeAgent:  # pylint: disable=too-many-arguments,too-many-positional-a
         self.knowledge = load_all_knowledge()
 
     def _run(self, prompt: str) -> Iterator[str]:
-        """Run opencode run --format json with the given prompt."""
+        """Run opencode run --format json with the given prompt.
+
+        For long prompts (>10k chars), writes to a temp file and uses
+        shell redirection to avoid OS argument length limits.
+        """
         model = self.config.model
         default_model = None
         opencode_json_path = os.path.expanduser("~/.config/opencode/opencode.json")
@@ -116,7 +104,7 @@ class OpencodeAgent:  # pylint: disable=too-many-arguments,too-many-positional-a
                 with open(opencode_json_path, "r", encoding="utf-8") as f:
                     config_data = json.load(f)
                     default_model = config_data.get("model")
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 pass
 
         effective_model = model or default_model
@@ -131,9 +119,11 @@ class OpencodeAgent:  # pylint: disable=too-many-arguments,too-many-positional-a
                 fallback_model = "opencode/deepseek-v4-flash-free"
                 if "streamlit" in sys.modules:
                     try:
-                        import streamlit as st
-                        st.sidebar.warning(f"Server locale offline. Ripiego su {fallback_model}")
-                    except Exception:
+                        import streamlit as st  # pylint: disable=import-outside-toplevel
+                        st.sidebar.warning(
+                            f"Server locale offline. Ripiego su {fallback_model}"
+                        )
+                    except Exception:  # pylint: disable=broad-exception-caught
                         pass
                 else:
                     print(
@@ -142,17 +132,40 @@ class OpencodeAgent:  # pylint: disable=too-many-arguments,too-many-positional-a
                     )
                 model = fallback_model
 
-        cmd = ["opencode", "run", "--format", "json", prompt]
-        if model:
-            cmd.extend(["--model", model])
+        # For long prompts, write to temp file to avoid argument length limits
+        temp_path = None
+        use_shell = len(prompt) > 10000
+
+        if use_shell:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False, encoding="utf-8"
+            ) as f:
+                f.write(prompt)
+                temp_path = f.name
+            cmd = f"opencode run --format json < '{temp_path}'"
+            if model:
+                cmd += f" --model {model}"
+        else:
+            cmd = ["opencode", "run", "--format", "json", prompt]
+            if model:
+                cmd.extend(["--model", model])
 
         try:
-            proc = subprocess.Popen(  # pylint: disable=consider-using-with
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            if use_shell:
+                proc = subprocess.Popen(  # pylint: disable=consider-using-with
+                    cmd,
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            else:
+                proc = subprocess.Popen(  # pylint: disable=consider-using-with
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
         except FileNotFoundError:
             yield "\n**Errore: opencode non trovato.**\n"
             return
@@ -162,7 +175,7 @@ class OpencodeAgent:  # pylint: disable=too-many-arguments,too-many-positional-a
             try:
                 for line in iter(stream.readline, ''):
                     q.put(line)
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 pass
             finally:
                 stream.close()
@@ -178,7 +191,7 @@ class OpencodeAgent:  # pylint: disable=too-many-arguments,too-many-positional-a
             try:
                 for line in iter(stream.readline, ''):
                     q.put(line)
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 pass
             finally:
                 stream.close()
@@ -239,6 +252,13 @@ class OpencodeAgent:  # pylint: disable=too-many-arguments,too-many-positional-a
                 yield f"\n**Errore subprocess (exit {proc.returncode}): {msg}**\n"
             else:
                 yield f"\n**Errore subprocess (exit {proc.returncode})**\n"
+
+        # Cleanup temp file
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
     def create_session(self) -> str:
         """Return a placeholder session ID (opencode run is stateless)."""
