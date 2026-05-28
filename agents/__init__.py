@@ -5,7 +5,9 @@ from .bank_importer import BankImporter
 from .trader_agent import TraderAgent
 from .recipe_researcher import RecipeResearcher
 from .opencode_agent import OpencodeAgent, OpencodeConfig, OpencodeResult
-from .opencode_debate import OpencodeDebate, DebateRound, DebateRecord, DebateHistory
+from .opencode_debate import OpencodeDebate, DebateRound, DebateRecord, DebateRecordMulti, DebateHistory, DebateHistoryMulti
+from .skill_loader import load_skills, get_available_slugs, load_skill
+from .knowledge_loader import load_skills_knowledge
 
 __all__ = [
     "AIProvider",
@@ -20,5 +22,11 @@ __all__ = [
     "OpencodeDebate",
     "DebateRound",
     "DebateRecord",
+    "DebateRecordMulti",
     "DebateHistory",
+    "DebateHistoryMulti",
+    "load_skills",
+    "load_skills_knowledge",
+    "get_available_slugs",
+    "load_skill",
 ]

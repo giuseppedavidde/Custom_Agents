@@ -5,7 +5,12 @@ agents/ai_provider.py
 agents/bank_importer.py
 agents/cloud_manager.py
 agents/cloud_ui.py
+agents/knowledge_loader.py
+agents/opencode_agent.py
+agents/opencode_debate.py
 agents/recipe_researcher.py
+agents/skill_loader.py
+agents/test_debate_multi_skill.py
 agents/trader_agent.py
 custom_agents.egg-info/PKG-INFO
 custom_agents.egg-info/SOURCES.txt

@@ -1,4 +1,4 @@
-"""Modulo OpencodeDebate: orchestratore a 3 round con dibattito tra analisi base e knowledge."""
+"""Modulo OpencodeDebate: orchestratore dibattito multi-round tra analisi base e knowledge skills."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from typing import Any, Iterator, Optional
 from pydantic import BaseModel, Field
 
 from .opencode_agent import OpencodeAgent, OpencodeConfig, load_all_knowledge
+from .skill_loader import load_skills, extract_frameworks
 
 
 class DebateRound(BaseModel):
@@ -24,7 +25,7 @@ class DebateRound(BaseModel):
 
 
 class DebateRecord(BaseModel):
-    """Record completo di un debate."""
+    """Record completo di un debate legacy a 3 round."""
 
     timestamp: datetime = Field(default_factory=datetime.now)
     ticker: str
@@ -36,27 +37,51 @@ class DebateRecord(BaseModel):
     final_confidence: float = 0.0
 
 
+class DebateRecordMulti(BaseModel):
+    """Record per debate multi-skill con N round (base + skills + sintesi)."""
+
+    timestamp: datetime = Field(default_factory=datetime.now)
+    ticker: str
+    analysis_type: str = "multi-skill"
+    skill_slugs: list[str] = []
+    rounds: list[DebateRound] = []
+    final_signal: str = "WAIT"
+    final_confidence: float = 0.0
+
+
 class DebateHistory(BaseModel):
-    """Storico dei debate salvati in sessione."""
+    """Storico dei debate legacy (3 round) salvati in sessione."""
 
     records: list[DebateRecord] = []
 
     def add(self, record: DebateRecord) -> None:
-        """Aggiunge un record alla cronologia."""
         self.records.append(record)
 
     def get_latest(self, ticker: str) -> Optional[DebateRecord]:
-        """Restituisce l'ultimo debate per un ticker."""
         for rec in reversed(self.records):
             if rec.ticker.upper() == ticker.upper():
                 return rec
         return None
 
     def get_all_for_ticker(self, ticker: str) -> list[DebateRecord]:
-        """Restituisce tutti i debate per un ticker."""
         return [
             rec for rec in self.records if rec.ticker.upper() == ticker.upper()
         ]
+
+
+class DebateHistoryMulti(BaseModel):
+    """Storico dei debate multi-skill (N round) salvati in sessione."""
+
+    records: list[DebateRecordMulti] = []
+
+    def add(self, record: DebateRecordMulti) -> None:
+        self.records.append(record)
+
+    def get_latest(self, ticker: str) -> Optional[DebateRecordMulti]:
+        for rec in reversed(self.records):
+            if rec.ticker.upper() == ticker.upper():
+                return rec
+        return None
 
 
 ROUND1_SYSTEM = """Sei un analista tecnico indipendente e obiettivo.
@@ -76,6 +101,32 @@ ROUND3_SYSTEM = """Sei un senior trader supervisore con anni di esperienza sui m
 Il tuo compito e' confrontare due analisi indipendenti per lo stesso ticker,
 identificare convergenze e divergenze, e produrre una sintesi obiettiva.
 Non hai nessun pregiudizio verso nessuna delle due scuole di pensiero."""
+
+ROUND_SKILL_SYSTEM = """Sei un trader specializzato nel framework "{skill_name}".
+Applica le conoscenze teoriche fornite per interpretare i dati di mercato.
+Usa i concetti, le regole e i setup del framework nella tua analisi.
+Identifica pattern, anomalie e setup operativi riconoscibili secondo questo framework."""
+
+ROUND_FINAL_SYSTEM = """Sei un senior trader supervisore con esperienza su tutti i framework di trading.
+Il tuo compito e' confrontare TUTTE le analisi indipendenti per lo stesso ticker,
+ciascuna basata su un diverso framework di trading.
+Identifica convergenze (punti in cui piu' framework concordano) e divergenze.
+Risolvi i conflitti usando il principio che la convergenza tra framework e' piu' affidabile di un singolo framework.
+Produci un verdetto unico e sintetico."""
+
+SLUG_TO_NAME = {
+    "wyckoff-2-0": "Wyckoff 2.0 — Structures, Volume Profile & Order Flow",
+    "volume-price-analysis": "Volume Price Analysis (VPA) — Coulling",
+    "volume-profile": "Volume Profile — The Insider's Guide",
+    "trades-about-to-happen": "Trades About to Happen — Weis Wave",
+    "trading-against-the-crowd": "Trading Against the Crowd — Sentiment Analysis",
+    "price-action-volman": "Price Action (5-min) — Bob Volman",
+    "options-playbook": "Options Playbook — Brian Overby",
+    "options-course-workbook": "Options Course Workbook — Fontanills",
+    "options-crash-course": "Options Crash Course",
+    "crypto-technical-analysis": "Crypto Technical Analysis",
+    "crypto-crash-course": "Crypto Crash Course",
+}
 
 
 def _fmt(val: Any, decimals: int = 2) -> str:
@@ -533,6 +584,215 @@ Produci un report in formato JSON:
             r3_prompt=r3_prompt,
         )
 
+    def debate_multi_skill(
+        self,
+        ticker: str,
+        price: float,
+        skill_slugs: Optional[list[str]] = None,
+        change: Optional[float] = None,
+        trend: str = "Unknown",
+        adx: Optional[float] = None,
+        rsi: Optional[float] = None,
+        stoch_k: Optional[float] = None,
+        stoch_d: Optional[float] = None,
+        williams_r: Optional[float] = None,
+        macd: Optional[float] = None,
+        macd_signal: Optional[float] = None,
+        macd_histogram: Optional[float] = None,
+        bb_position: str = "N/A",
+        bb_width: Optional[float] = None,
+        volume_ratio: Optional[float] = None,
+        volume_signal: str = "N/A",
+        patterns: Optional[list[str]] = None,
+        holders_text: Optional[str] = None,
+        financials_text: Optional[str] = None,
+    ) -> Iterator[str]:
+        """Debate multi-skill: R1 base + RN skill rounds + Final synthesis.
+
+        Carica le skills specificate, esegue un round per ognuna,
+        poi produce una sintesi finale che confronta tutte le prospettive.
+        """
+        if not skill_slugs:
+            yield from self.debate_technical_analysis(
+                ticker=ticker, price=price, change=change,
+                trend=trend, adx=adx, rsi=rsi,
+                stoch_k=stoch_k, stoch_d=stoch_d,
+                williams_r=williams_r, macd=macd,
+                macd_signal=macd_signal, macd_histogram=macd_histogram,
+                bb_position=bb_position, bb_width=bb_width,
+                volume_ratio=volume_ratio, volume_signal=volume_signal,
+                patterns=patterns, holders_text=holders_text,
+                financials_text=financials_text,
+            )
+            return
+
+        skills_content = load_skills(skill_slugs)
+        if not skills_content:
+            yield "⚠️ Nessuna skill disponibile. Uso analisi standard.\n\n"
+            yield from self.debate_technical_analysis(
+                ticker=ticker, price=price, change=change,
+                trend=trend, adx=adx, rsi=rsi,
+                stoch_k=stoch_k, stoch_d=stoch_d,
+                williams_r=williams_r, macd=macd,
+                macd_signal=macd_signal, macd_histogram=macd_histogram,
+                bb_position=bb_position, bb_width=bb_width,
+                volume_ratio=volume_ratio, volume_signal=volume_signal,
+                patterns=patterns, holders_text=holders_text,
+                financials_text=financials_text,
+            )
+            return
+
+        kw = dict(
+            ticker=ticker, price=price, change=change,
+            trend=trend, adx=adx, rsi=rsi,
+            stoch_k=stoch_k, stoch_d=stoch_d,
+            williams_r=williams_r, macd=macd,
+            macd_signal=macd_signal, macd_histogram=macd_histogram,
+            bb_position=bb_position, bb_width=bb_width,
+            volume_ratio=volume_ratio, volume_signal=volume_signal,
+            patterns=patterns,
+            holders_text=holders_text, financials_text=financials_text,
+        )
+
+        change_str = f" ({change:+.2f}%)" if change is not None else ""
+        patterns_str = ", ".join(patterns) if patterns else "Nessuno"
+
+        n_skills = len(skills_content)
+        total_rounds = 1 + n_skills + 1  # R1 + Rn skills + Final
+
+        # ── R1: Base analysis (no knowledge) ──
+        yield f"## 📊 Round 1/{total_rounds}: Analisi Tecnica Base\n\n"
+        r1_prompt = self._make_prompt_round1(**kw)
+        r1_text = ""
+        for chunk in self.agent.stream_prompt(r1_prompt):
+            r1_text += chunk
+            yield chunk
+        if not r1_text.strip():
+            yield "\n> ⚠️ *Nessun output ricevuto per il Round 1.*"
+
+        # ── R2..RN: Skill-based rounds ──
+        skill_texts: dict[str, str] = {}
+        for i, (slug, sk_content) in enumerate(skills_content.items(), start=2):
+            skill_name = slug.replace("-", " ").title()
+            frameworks = extract_frameworks(sk_content)
+            yield f"\n\n---\n\n## 📈 Round {i}/{total_rounds}: {skill_name}\n\n"
+            yield f"> Framework: {SLUG_TO_NAME.get(slug, skill_name)}\n\n"
+
+            system = ROUND_SKILL_SYSTEM.format(skill_name=skill_name)
+            prompt = f"""{system}
+
+CONOSCENZA TEORICA ({skill_name}):
+{frameworks}
+
+DATI DI MERCATO {ticker}:
+- Prezzo: {price}{change_str}
+- Trend: {trend} (ADX: {_fmt(adx)})
+- RSI(14): {_fmt(rsi)}
+- Stocastico: {_fmt(stoch_k)}/{_fmt(stoch_d)}
+- Williams %R: {_fmt(williams_r)}
+- MACD: {_fmt(macd, 4)} / Signal: {_fmt(macd_signal, 4)} / Hist: {_fmt(macd_histogram, 4)}
+- Bollinger: posizione={bb_position}, larghezza={_fmt(bb_width)}
+- Volume: {_fmt(volume_ratio)}x ({volume_signal})
+- Pattern: {patterns_str}
+"""
+            if holders_text:
+                prompt += f"\nAZIONARIATO:\n{holders_text}\n"
+            if financials_text:
+                prompt += f"\nFINANZIARI:\n{financials_text}\n"
+
+            prompt += """
+Applica i concetti del framework ai dati forniti.
+Identifica setup operativi, pattern, anomalie o conferme.
+Produci un report in formato JSON:
+{"signal": "LONG/SHORT/WAIT", "confidence": 0-100, "setup": "...", "analysis": "...", "key_levels": {"support": X, "resistance": Y}}
+"""
+            skill_text = ""
+            for chunk in self.agent.stream_prompt(prompt):
+                skill_text += chunk
+                yield chunk
+            if not skill_text.strip():
+                yield "\n> ⚠️ *Nessun output ricevuto.*"
+            skill_texts[slug] = skill_text
+
+        # ── Final round: Synthesis ──
+        yield f"\n\n---\n\n## 🏆 Round {total_rounds}/{total_rounds}: Sintesi Finale\n\n"
+
+        final_prompt = f"""{ROUND_FINAL_SYSTEM}
+
+Confronta TUTTE le analisi indipendenti per {ticker}:
+
+── ANALISI BASE (senza framework) ──
+{r1_text[:2000]}
+
+"""
+        for slug, sk_text in skill_texts.items():
+            skill_name = slug.replace("-", " ").title()
+            final_prompt += f"── ANALISI {skill_name} ──\n{sk_text[:2000]}\n\n"
+
+        final_prompt += """
+Confronta oggettivamente TUTTE le analisi:
+
+1. PUNTI DI CONVERGENZA: dove concordano? (massima confidenza)
+2. PUNTI DI DIVERGENZA: dove discordano? (risolvi il conflitto)
+3. PESO: dai piu' peso ai punti in cui piu' framework convergono
+4. SINTESI FINALE: verdetto unico che integra tutte le prospettive
+
+Produci un report in formato JSON:
+{"final_signal": "LONG/SHORT/WAIT", "confidence": 0-100, "convergences": [...], "divergences": [...], "resolution": "...", "synthesis": "..."}
+"""
+        final_text = ""
+        for chunk in self.agent.stream_prompt(final_prompt):
+            final_text += chunk
+            yield chunk
+        if not final_text.strip():
+            yield "\n> ⚠️ *Nessun output ricevuto per la Sintesi Finale.*"
+
+        # Save multi-skill record with all N rounds preserved
+        r3_signal = _guess_signal(final_text)
+        all_rounds: list[DebateRound] = [
+            DebateRound(
+                name="Analisi Base",
+                knowledge_used="none",
+                prompt=r1_prompt,
+                result=r1_text,
+                parsed_signal=_guess_signal(r1_text)["signal"],
+                parsed_confidence=_guess_signal(r1_text)["confidence"],
+            ),
+        ]
+        for slug, sk_text in skill_texts.items():
+            skill_name = SLUG_TO_NAME.get(slug, slug.replace("-", " ").title())
+            all_rounds.append(DebateRound(
+                name=skill_name,
+                knowledge_used=slug,
+                prompt="",
+                result=sk_text,
+                parsed_signal=_guess_signal(sk_text)["signal"],
+                parsed_confidence=_guess_signal(sk_text)["confidence"],
+            ))
+        all_rounds.append(DebateRound(
+            name="Sintesi Finale",
+            knowledge_used="none",
+            prompt=final_prompt,
+            result=final_text,
+            parsed_signal=r3_signal["signal"],
+            parsed_confidence=r3_signal["confidence"],
+        ))
+        record = DebateRecordMulti(
+            ticker=ticker.upper(),
+            analysis_type="multi-skill",
+            skill_slugs=list(skill_texts.keys()),
+            rounds=all_rounds,
+            final_signal=r3_signal["signal"],
+            final_confidence=r3_signal["confidence"],
+        )
+        try:
+            import streamlit as st  # type: ignore[import-untyped]
+            if "debate_history_multi" not in st.session_state:
+                st.session_state.debate_history_multi = DebateHistoryMulti()
+            st.session_state.debate_history_multi.add(record)
+        except ImportError:
+            pass
+
     def _save_debate_record(
         self,
         ticker: str,
@@ -591,48 +851,52 @@ Produci un report in formato JSON:
 
     @staticmethod
     def render_debate_history_ui() -> None:
-        """Render storico debate in Streamlit."""
+        """Render storico debate in Streamlit (legacy + multi-skill)."""
         try:
             import streamlit as st
         except ImportError:
             return
 
+        # ── Legacy 3-round history ──
         history: Optional[DebateHistory] = st.session_state.get("debate_history")
-        if not history or not history.records:
+        history_multi: Optional[DebateHistoryMulti] = st.session_state.get("debate_history_multi")
+
+        if (not history or not history.records) and (not history_multi or not history_multi.records):
             return
 
         with st.expander("📜 Storico Debate", expanded=False):
-            total = len(history.records)
+            total = (len(history.records) if history else 0) + (len(history_multi.records) if history_multi else 0)
             st.caption(f"Totale: {total} debate")
 
-            cols = st.columns([1, 1, 1, 1, 2])
-            cols[0].markdown("**Ticker**")
-            cols[1].markdown("**Tipo**")
-            cols[2].markdown("**Segnale**")
-            cols[3].markdown("**Conf.**")
-            cols[4].markdown("**Data**")
+            if history and history.records:
+                with st.popover(f"🎯 Legacy ({len(history.records)}):", use_container_width=True):
+                    for rec in reversed(history.records[-20:]):
+                        r = rec
+                        c1, c2, c3, c4 = st.columns([2, 1.5, 1, 1])
+                        c1.markdown(f"**{r.ticker}**")
+                        c2.markdown(r.analysis_type)
+                        c3.markdown(f"`{r.final_signal}`")
+                        c4.markdown(f"{r.final_confidence:.0f}%")
 
-            for rec in reversed(history.records[-50:]):
-                r = rec
-                c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
-                c1.markdown(f"**{r.ticker}**")
-                c2.markdown(r.analysis_type)
-                c3.markdown(f"`{r.final_signal}`")
-                c4.markdown(f"{r.final_confidence:.0f}%")
-                c5.markdown(r.timestamp.strftime("%d/%m/%Y %H:%M"))
+            if history_multi and history_multi.records:
+                with st.popover(f"🧪 Multi-Skill ({len(history_multi.records)}):", use_container_width=True):
+                    for rec in reversed(history_multi.records[-20:]):
+                        r = rec
+                        skills_str = ", ".join(s[:12] for s in r.skill_slugs)
+                        c1, c2, c3, c4 = st.columns([2, 1.5, 1, 1])
+                        c1.markdown(f"**{r.ticker}**")
+                        c2.markdown(skills_str)
+                        c3.markdown(f"`{r.final_signal}`")
+                        c4.markdown(f"{r.final_confidence:.0f}%")
 
-                with st.popover("Dettaglio"):
-                    st.subheader(f"Round 1: {r.round1.name}")
-                    st.caption(f"Segnale: {r.round1.parsed_signal} | Conf: {r.round1.parsed_confidence:.0f}%")
-                    st.text(r.round1.result[:500])
-
-                    st.subheader(f"Round 2: {r.round2.name}")
-                    st.caption(f"Knowledge: {r.round2.knowledge_used} | Segnale: {r.round2.parsed_signal} | Conf: {r.round2.parsed_confidence:.0f}%")
-                    st.text(r.round2.result[:500])
-
-                    st.subheader(f"Round 3: {r.synthesis.name}")
-                    st.caption(f"Segnale finale: {r.final_signal} | Conf: {r.final_confidence:.0f}%")
-                    st.text(r.synthesis.result[:500])
+                        with st.popover(f"Dettaglio {r.ticker}", use_container_width=True):
+                            for i, round_ in enumerate(r.rounds):
+                                st.subheader(f"Round {i+1}: {round_.name}")
+                                c = round_.parsed_confidence
+                                conf_str = f"{c:.0f}%" if c is not None else "N/A"
+                                st.caption(f"Segnale: {round_.parsed_signal} | Conf: {conf_str}")
+                                if round_.result:
+                                    st.text(round_.result[:400])
 
     @staticmethod
     def render_streamlit_sidebar() -> Optional[OpencodeConfig]:
