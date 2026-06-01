@@ -1,6 +1,6 @@
 """Modulo AI Provider per la selezione dinamica del modello Gemini e Ollama."""
 
-from typing import Optional, List, Any, Union, Iterator
+from typing import Optional, List, Any, Union, Iterator, Tuple
 import os
 import time
 import random
