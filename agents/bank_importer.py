@@ -8,16 +8,27 @@ to match the Budget Application's database schema.
 import pandas as pd
 import json
 import io
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from .opencode_agent import OpencodeAgent
+
 
 class BankImporter:
     """Handles the import and processing of bank statements."""
-    
-    def __init__(self, ai_provider):
+
+    def __init__(
+        self,
+        ai_provider=None,
+        opencode_agent: Optional["OpencodeAgent"] = None,
+    ):
         """
         Args:
             ai_provider: An instance of the AIProvider class to be used for categorization.
+            opencode_agent: An instance of OpencodeAgent to use instead of AIProvider.
         """
         self.ai_provider = ai_provider
+        self.opencode_agent = opencode_agent
 
     def _clean_amount(self, amount_str):
         """Converts German format (1.234,56) to float (1234.56)."""
@@ -159,12 +170,16 @@ class BankImporter:
         # 1.5 Standardize Columns
         df = self._standardize_columns(df)
 
-        # 2. Prepare for AI Categorization
-        model = self.ai_provider.get_model(json_mode=True)
+        # 2. Prepare for Categorization
+        if self.opencode_agent:
+            model = None
+        else:
+            model = self.ai_provider.get_model(json_mode=True)
+
         mappings = {}
         
         # Keep original category for comparison (if present, else empty)
-        df['Analyzed_Category'] = df['Std_Category'] 
+        df['Analyzed_Category'] = df['Std_Category']
 
         items_to_process = []
         for index, row in df.iterrows():
@@ -192,54 +207,14 @@ class BankImporter:
                 percent = base_c + (i / len(items_to_process)) * (0.9 - base_c)
                 progress_callback(percent, f"Analisi AI in corso: Batch {current_batch_num}/{total_batches}...")
             
-            # ... batch processing logic calls model ... 
-            
             batch = items_to_process[i:i+BATCH_SIZE]
-            
-            prompt_text = f"""
-            You are an expert financial assistant.
-            Your task is to MAP bank transactions to valid budget categories.
-            
-            VALID CATEGORIES (Exact Match Required):
-            {target_categories}
-            
-            RULES:
-            1. "Freizeit & Genuss" is generic. You MUST be specific based on the description:
-            - Restaurants, Bars, Food delivery -> 'Cene, Pranzo'
-            - Pharmacies (Apotheke, DM often), Doctors -> 'Medicinali'
-            - Trains, Buses, Taxi, Uber -> 'Trasporti'
-            - Flights, Hotels, Airbnb, Cinema, Events -> 'Viaggi, Divertimento'
-            - Gas stations (Tankstelle) -> 'Carburante'
-            - Subscriptions (Spotify, Netflix) -> 'PayPal + Abbonamenti'
-            2. "Lebensmittel" (Groceries) or Supermarkets -> 'Alimentari'.
-            3. "Mobilität" usually maps to 'Carburante' or 'Trasporti'.
-            4. "Miete" (Rent) / Insurance -> 'Immobili (affitto, mutuo, tasse, assicurazione)'.
-            5. Salary/Wages -> 'Stipendio'.
-            6. Incoming transfers -> 'Reddito aggiuntivo' (unless typical salary).
-            
-            TRANSACTIONS:
-            {json.dumps(batch)}
-            
-            Return JSON:
-            {{ "mappings": [ {{ "id": <id>, "new_category": "<ValidCategory>" }} ] }}
-            """
-            
-            try:
-                response = model.generate_content(prompt_text)
-                # Helper for Gemini/Ollama response wrapper differences
-                text_response = response.text if hasattr(response, 'text') else str(response)
-                
-                # Simple cleanup for potential markdown code blocks
-                if "```json" in text_response:
-                    text_response = text_response.replace("```json", "").replace("```", "")
-                
-                result = json.loads(text_response)
-                
-                for m in result.get("mappings", []):
-                    mappings[m['id']] = m['new_category']
-            except Exception as e:
-                print(f"Error in batch {i}: {e}")
-                # Skip batch or partially fail? We'll leave original categories.
+
+            if self.opencode_agent:
+                batch_mappings = self._categorize_with_opencode(batch, target_categories)
+                if batch_mappings:
+                    mappings.update(batch_mappings)
+            else:
+                self._categorize_with_ai(model, batch, target_categories, mappings)
         
         if progress_callback:
             progress_callback(0.9, "Applicazione modifiche e calcoli finali...")
@@ -346,6 +321,96 @@ class BankImporter:
         
         return df 
 
+
+    def _categorize_with_ai(self, model, batch, target_categories, mappings):
+        """Categorize a batch using the AIProvider model."""
+        prompt_text = f"""
+        You are an expert financial assistant.
+        Your task is to MAP bank transactions to valid budget categories.
+
+        VALID CATEGORIES (Exact Match Required):
+        {target_categories}
+
+        RULES:
+        1. "Freizeit & Genuss" is generic. You MUST be specific based on the description:
+        - Restaurants, Bars, Food delivery -> 'Cene, Pranzo'
+        - Pharmacies (Apotheke, DM often), Doctors -> 'Medicinali'
+        - Trains, Buses, Taxi, Uber -> 'Trasporti'
+        - Flights, Hotels, Airbnb, Cinema, Events -> 'Viaggi, Divertimento'
+        - Gas stations (Tankstelle) -> 'Carburante'
+        - Subscriptions (Spotify, Netflix) -> 'PayPal + Abbonamenti'
+        2. "Lebensmittel" (Groceries) or Supermarkets -> 'Alimentari'.
+        3. "Mobilität" usually maps to 'Carburante' or 'Trasporti'.
+        4. "Miete" (Rent) / Insurance -> 'Immobili (affitto, mutuo, tasse, assicurazione)'.
+        5. Salary/Wages -> 'Stipendio'.
+        6. Incoming transfers -> 'Reddito aggiuntivo' (unless typical salary).
+
+        TRANSACTIONS:
+        {json.dumps(batch)}
+
+        Return JSON:
+        {{ "mappings": [ {{ "id": <id>, "new_category": "<ValidCategory>" }} ] }}
+        """
+        try:
+            response = model.generate_content(prompt_text)
+            text_response = response.text if hasattr(response, 'text') else str(response)
+            if "```json" in text_response:
+                text_response = text_response.replace("```json", "").replace("```", "")
+            result = json.loads(text_response)
+            for m in result.get("mappings", []):
+                mappings[m['id']] = m['new_category']
+        except Exception as e:
+            print(f"Error in AI categorization: {e}")
+
+    def _categorize_with_opencode(self, batch, target_categories):
+        """Categorize a batch of transactions using OpencodeAgent."""
+        prompt_text = f"""
+        You are an expert financial assistant.
+        Your task is to MAP bank transactions to valid budget categories.
+
+        VALID CATEGORIES (Exact Match Required):
+        {target_categories}
+
+        RULES:
+        1. "Freizeit & Genuss" is generic. You MUST be specific based on the description:
+        - Restaurants, Bars, Food delivery -> 'Cene, Pranzo'
+        - Pharmacies (Apotheke, DM often), Doctors -> 'Medicinali'
+        - Trains, Buses, Taxi, Uber -> 'Trasporti'
+        - Flights, Hotels, Airbnb, Cinema, Events -> 'Viaggi, Divertimento'
+        - Gas stations (Tankstelle) -> 'Carburante'
+        - Subscriptions (Spotify, Netflix) -> 'PayPal + Abbonamenti'
+        2. "Lebensmittel" (Groceries) or Supermarkets -> 'Alimentari'.
+        3. "Mobilität" usually maps to 'Carburante' or 'Trasporti'.
+        4. "Miete" (Rent) / Insurance -> 'Immobili (affitto, mutuo, tasse, assicurazione)'.
+        5. Salary/Wages -> 'Stipendio'.
+        6. Incoming transfers -> 'Reddito aggiuntivo' (unless typical salary).
+
+        TRANSACTIONS:
+        {json.dumps(batch)}
+
+        Return ONLY valid JSON (no markdown):
+        {{ "mappings": [ {{ "id": <id>, "new_category": "<ValidCategory>" }} ] }}
+        """
+        result = self.opencode_agent.run_prompt(prompt_text)
+        if not result.success:
+            print(f"OpenCode error: {result.error}")
+            return {}
+
+        text = result.text.strip()
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+
+        try:
+            parsed = json.loads(text)
+            batch_mappings = {}
+            for m in parsed.get("mappings", []):
+                batch_mappings[m['id']] = m['new_category']
+            return batch_mappings
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Error parsing OpenCode response: {e}")
+            return {}
 
     def generate_report(self, df):
         """Generates a markdown table highlighting changes."""

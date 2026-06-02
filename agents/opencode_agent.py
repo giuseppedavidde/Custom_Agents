@@ -448,6 +448,7 @@ Analizza la situazione di mercato. Produci un'analisi strutturata con:
         enabled = st.sidebar.checkbox(
             "Opencode Agent",
             value=False,
+            key="opencode_agent_enabled",
             help="Usa opencode per analisi AI (server mode)",
         )
         if not enabled:
