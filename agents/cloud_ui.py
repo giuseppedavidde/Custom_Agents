@@ -8,8 +8,14 @@ import datetime
 from agents.cloud_manager import CloudManager
 
 
-def render_cloud_sync_ui(DATA_FILE, is_sidebar=True):
-    """Renderizza la UI per il Cloud Sync (GitHub)."""
+def render_cloud_sync_ui(DATA_FILE, is_sidebar=True, session_data_key=None):
+    """Renderizza la UI per il Cloud Sync (GitHub).
+    
+    Args:
+        DATA_FILE: percorso file locale (fallback)
+        is_sidebar: mostra nella sidebar
+        session_data_key: se fornito, Push usa i dati in sessione invece del file locale
+    """
     parent = st.sidebar if is_sidebar else st
 
     if is_sidebar:
@@ -122,8 +128,9 @@ def render_cloud_sync_ui(DATA_FILE, is_sidebar=True):
                                 else:
                                     with open(DATA_FILE, "w", encoding="utf-8") as f:
                                         f.write(content)
-                                # Salva in session state per lettura come "cloud data"
-                                st.session_state["portfolio_cloud_data"] = content
+                                # Salva in session state (se specificata una chiave)
+                                target_key = session_data_key or "portfolio_cloud_data"
+                                st.session_state[target_key] = content
                                 st.toast(f"Scaricato da {selected_repo}", icon="✅")
                                 st.rerun()
                             else:
@@ -133,12 +140,25 @@ def render_cloud_sync_ui(DATA_FILE, is_sidebar=True):
                         "⬆️ Push", key=f"btn_push_{'sb' if is_sidebar else 'main'}"
                     ):
                         with st.spinner("Caricamento..."):
-                            ok, msg = cm.github_upload(
-                                selected_repo,
-                                selected_file_remote,
-                                DATA_FILE,
-                                commit_message="Update from Budget App Dashboard",
-                            )
+                            # Usa dati in sessione se disponibili, altrimenti file locale
+                            push_data = None
+                            if session_data_key and session_data_key in st.session_state:
+                                push_data = st.session_state[session_data_key]
+
+                            if push_data is not None:
+                                ok, msg = cm.upload_file_content(
+                                    selected_repo,
+                                    selected_file_remote,
+                                    push_data,
+                                    commit_message="Update from Portfolio Dashboard",
+                                )
+                            else:
+                                ok, msg = cm.github_upload(
+                                    selected_repo,
+                                    selected_file_remote,
+                                    DATA_FILE,
+                                    commit_message="Update from Portfolio Dashboard",
+                                )
                             if ok:
                                 st.toast(f"Caricato: {msg}", icon="✅")
                             else:
