@@ -110,15 +110,24 @@ def render_cloud_sync_ui(DATA_FILE, is_sidebar=True):
                         "⬇️ Pull", key=f"btn_pull_{'sb' if is_sidebar else 'main'}"
                     ):
                         with st.spinner("Scaricamento..."):
-                            # Se non siamo in sidebar, DATA_FILE potrebbe non esistere, ma scaricandolo lo creiamo
-                            ok, msg = cm.github_download(
-                                selected_repo, selected_file_remote, DATA_FILE
+                            # Scarica in memoria per poterlo usare in sessione
+                            ok, content = cm.fetch_file_content(
+                                selected_repo, selected_file_remote
                             )
                             if ok:
-                                st.toast(f"Scaricato: {msg}", icon="✅")
+                                # Salva su disco (backwards compat)
+                                if isinstance(content, bytes):
+                                    with open(DATA_FILE, "wb") as f:
+                                        f.write(content)
+                                else:
+                                    with open(DATA_FILE, "w", encoding="utf-8") as f:
+                                        f.write(content)
+                                # Salva in session state per lettura come "cloud data"
+                                st.session_state["portfolio_cloud_data"] = content
+                                st.toast(f"Scaricato da {selected_repo}", icon="✅")
                                 st.rerun()
                             else:
-                                st.error(msg)
+                                st.error(content)
                 with c_up:
                     if st.button(
                         "⬆️ Push", key=f"btn_push_{'sb' if is_sidebar else 'main'}"
