@@ -508,6 +508,68 @@ class OpenRouterWrapper:
             yield f"❌ Errore OpenRouter Stream: {e}"
 
 
+class OpencodeGoWrapper:
+    """Wrapper per OpenCode Go API (OpenAI-compatible, endpoint /v1/chat/completions).
+
+    Documentazione: https://opencode.ai/docs/it/go/
+    Endpoint: https://opencode.ai/zen/go/v1/chat/completions
+    API Key: Da https://opencode.ai/auth (abbonamento Go richiesto)
+    """
+    OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
+
+    def __init__(self, provider, model_name: str, json_mode: bool = False):
+        self.provider = provider
+        self.model_name = model_name or "deepseek-v4-pro"
+        self.json_mode = json_mode
+        if not OPENAI_AVAILABLE:
+            raise ImportError("Libreria 'openai' non installata. Esegui: pip install openai")
+        self.client = openai_lib.OpenAI(
+            base_url=self.OPENCODE_BASE_URL,
+            api_key=self.provider.api_key,
+        )
+
+    def _build_messages(self, prompt: Any) -> list:
+        content, images = process_multimodal_input(prompt, self.model_name)
+        if images:
+            content += "\n[Note: Image attachments not supported via OpenCode Go wrapper]\n"
+        return [{"role": "user", "content": content}]
+
+    def generate_content(self, prompt: Any):
+        try:
+            messages = self._build_messages(prompt)
+            kwargs = {
+                "model": self.model_name,
+                "messages": messages,
+            }
+            if self.json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+
+            response = self.client.chat.completions.create(**kwargs)
+
+            class Response:
+                def __init__(self, text):
+                    self.text = text
+
+            return Response(response.choices[0].message.content)
+        except Exception as e:
+            raise RuntimeError(f"OpenCode Go Error: {e}") from e
+
+    def generate_stream(self, prompt: Any):
+        try:
+            messages = self._build_messages(prompt)
+            stream = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta is not None:
+                    yield delta
+        except Exception as e:
+            yield f"❌ Errore OpenCode Go Stream: {e}"
+
+
 class LlamaCppWrapper:
     """Wrapper per llama.cpp server (OpenAI-compatible API)."""
 
@@ -647,6 +709,24 @@ class AIProvider:
     ]
 
     PUTER_BASE_URL = "https://api.puter.com/puterai/openai/v1/"
+
+    OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1"
+    OPENCODE_GO_MODELS = [
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "glm-5",
+        "glm-5.1",
+        "kimi-k2.5",
+        "kimi-k2.6",
+        "mimo-v2.5",
+        "mimo-v2.5-pro",
+        "minimax-m3",
+        "minimax-m2.7",
+        "minimax-m2.5",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+    ]
 
     LLAMACPP_HOST = "localhost"
     LLAMACPP_PORT = 8080
@@ -800,6 +880,19 @@ class AIProvider:
                 f"🤖 AI Provider impostato su OpenRouter: {self.current_model_name}"
             )
 
+        elif self.provider_type == "opencode":
+            if not OPENAI_AVAILABLE:
+                raise ImportError(
+                    "Libreria 'openai' non installata. Esegui: pip install openai"
+                )
+            self.api_key = api_key or os.getenv("OPENCODE_GO_API_KEY")
+            if not self.api_key:
+                print("⚠️ OPENCODE_GO_API_KEY mancante. Ottieni la chiave da opencode.ai/auth.")
+            self.current_model_name = self.target_model or "deepseek-v4-pro"
+            self.log_debug(
+                f"🤖 AI Provider impostato su OpenCode Go: {self.current_model_name}"
+            )
+
         elif self.provider_type == "llamacpp":
             if not OPENAI_AVAILABLE:
                 raise ImportError(
@@ -819,7 +912,7 @@ class AIProvider:
         LlamaCpp viene incluso se lo script del server è presente su disco,
         indipendentemente dal fatto che il server sia in esecuzione.
         """
-        providers = ["Gemini", "Groq", "Ollama", "Puter", "OpenRouter"]
+        providers = ["Gemini", "Groq", "Ollama", "Puter", "OpenRouter", "Opencode"]
         if os.path.isfile(AIProvider.LLAMACPP_SERVER_SCRIPT):
             providers.append("LlamaCpp")
         return providers
@@ -926,6 +1019,11 @@ class AIProvider:
             return ["anthropic/claude-3.5-sonnet", "openai/gpt-4o", "google/gemini-pro-1.5"]
 
     @staticmethod
+    def get_opencode_models() -> List[str]:
+        """Restituisce la lista dei modelli disponibili su OpenCode Go."""
+        return list(AIProvider.OPENCODE_GO_MODELS)
+
+    @staticmethod
     def detect_llamacpp(host: str = None, port: int = None) -> bool:
         """Verifica se llama-server è raggiungibile."""
         host = host or AIProvider.LLAMACPP_HOST
@@ -972,6 +1070,8 @@ class AIProvider:
                 port=self.LLAMACPP_PORT,
                 json_mode=json_mode,
             )
+        elif self.provider_type == "opencode":
+            return OpencodeGoWrapper(self, self.current_model_name, json_mode)
         return GeminiWrapper(self, json_mode)
 
     def _init_gemini_chain(self):
@@ -1028,6 +1128,7 @@ class AIProvider:
                 else "🧠 Claude (Puter Free)" if x.lower() == "puter"
                 else "🌐 OpenRouter (Unified API)" if x.lower() == "openrouter"
                 else "🦙 LlamaCpp (TurboQuant)" if x.lower() == "llamacpp"
+                else "🔵 OpenCode Go (Low-Cost)" if x.lower() == "opencode"
                 else x
             ),
         )
@@ -1148,6 +1249,23 @@ class AIProvider:
             else:
                 puter_models = AIProvider.get_puter_models()
                 ai_model_name = st.sidebar.selectbox("Claude Model", puter_models)
+
+        elif ai_provider == "opencode":
+            api_key = os.getenv("OPENCODE_GO_API_KEY")
+            if not api_key:
+                api_key = st.sidebar.text_input(
+                    "OpenCode Go API Key",
+                    type="password",
+                    help="Ottieni la chiave da opencode.ai/auth (abbonamento Go richiesto).",
+                )
+                if api_key:
+                    os.environ["OPENCODE_GO_API_KEY"] = api_key
+
+            if not os.getenv("OPENCODE_GO_API_KEY"):
+                st.sidebar.warning("🔑 OpenCode Go API Key required. Abbonati su opencode.ai/auth.")
+            else:
+                opencode_models = AIProvider.get_opencode_models()
+                ai_model_name = st.sidebar.selectbox("Model", opencode_models, index=0)
 
         else:
             # Gemini
