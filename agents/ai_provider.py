@@ -177,6 +177,8 @@ class GroqWrapper:
             )
 
             for chunk in stream:
+                if not chunk.choices:
+                    continue
                 if chunk.choices[0].delta.content is not None:
                     yield chunk.choices[0].delta.content
 
@@ -437,6 +439,8 @@ class PuterWrapper:
                 stream=True,
             )
             for chunk in stream:
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta.content
                 if delta is not None:
                     yield delta
@@ -501,6 +505,8 @@ class OpenRouterWrapper:
                 stream=True,
             )
             for chunk in stream:
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta.content
                 if delta is not None:
                     yield delta
@@ -563,6 +569,8 @@ class OpencodeGoWrapper:
                 stream=True,
             )
             for chunk in stream:
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta.content
                 if delta is not None:
                     yield delta
@@ -655,6 +663,8 @@ class LlamaCppWrapper:
             stream = self.client.chat.completions.create(**kwargs)
 
             for chunk in stream:
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta.content
                 if delta is not None:
                     yield delta
@@ -714,18 +724,17 @@ class AIProvider:
     OPENCODE_GO_MODELS = [
         "deepseek-v4-pro",
         "deepseek-v4-flash",
-        "glm-5",
         "glm-5.1",
-        "kimi-k2.5",
+        "glm-5.2",
         "kimi-k2.6",
+        "kimi-k2.7-code",
         "mimo-v2.5",
         "mimo-v2.5-pro",
-        "minimax-m3",
         "minimax-m2.7",
-        "minimax-m2.5",
+        "minimax-m3",
+        "qwen3.6-plus",
         "qwen3.7-max",
         "qwen3.7-plus",
-        "qwen3.6-plus",
     ]
 
     LLAMACPP_HOST = "localhost"
@@ -1018,9 +1027,46 @@ class AIProvider:
         except Exception:
             return ["anthropic/claude-3.5-sonnet", "openai/gpt-4o", "google/gemini-pro-1.5"]
 
+    _opencode_models_cache: List[str] | None = None
+    _opencode_models_cache_time: float = 0
+
     @staticmethod
-    def get_opencode_models() -> List[str]:
-        """Restituisce la lista dei modelli disponibili su OpenCode Go."""
+    def get_opencode_models(*, force: bool = False) -> List[str]:
+        """Restituisce la lista dei modelli disponibili su OpenCode Go.
+
+        Recupera i modelli dinamicamente da `opencode models` (filtrando
+        per provider opencode-go). Fallback alla lista hardcoded se il CLI
+        non e' disponibile. Cache invalidata ogni 5 minuti (o subito se force=True).
+        """
+        now = time.monotonic()
+        cache = AIProvider._opencode_models_cache
+        cache_time = AIProvider._opencode_models_cache_time
+
+        if not force and cache is not None and now - cache_time < 300:
+            return list(cache)
+
+        try:
+            result = subprocess.run(
+                ["opencode", "models"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if result.returncode == 0:
+                models = sorted({
+                    m.strip().removeprefix("opencode-go/")
+                    for m in result.stdout.splitlines()
+                    if m.strip().startswith("opencode-go/")
+                })
+                if models:
+                    AIProvider._opencode_models_cache = models
+                    AIProvider._opencode_models_cache_time = now
+                    return models
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
+        # Fallback alla lista hardcoded
         return list(AIProvider.OPENCODE_GO_MODELS)
 
     @staticmethod
@@ -1264,8 +1310,15 @@ class AIProvider:
             if not os.getenv("OPENCODE_GO_API_KEY"):
                 st.sidebar.warning("🔑 OpenCode Go API Key required. Abbonati su opencode.ai/auth.")
             else:
-                opencode_models = AIProvider.get_opencode_models()
-                ai_model_name = st.sidebar.selectbox("Model", opencode_models, index=0)
+                oc_col1, oc_col2 = st.sidebar.columns([4, 1])
+                with oc_col1:
+                    opencode_models = AIProvider.get_opencode_models()
+                    ai_model_name = st.selectbox("Model", opencode_models, index=0, key="oc_model_sel")
+                with oc_col2:
+                    st.markdown("")
+                    if st.button("🔄", key="oc_refresh_btn", help="Aggiorna lista modelli"):
+                        AIProvider._opencode_models_cache = None
+                        st.rerun()
 
         else:
             # Gemini
