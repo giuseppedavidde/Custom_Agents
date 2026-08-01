@@ -1034,9 +1034,10 @@ class AIProvider:
     def get_opencode_models(*, force: bool = False) -> List[str]:
         """Restituisce la lista dei modelli disponibili su OpenCode Go.
 
-        Recupera i modelli dinamicamente da `opencode models` (filtrando
-        per provider opencode-go). Fallback alla lista hardcoded se il CLI
-        non e' disponibile. Cache invalidata ogni 5 minuti (o subito se force=True).
+        Interseca i modelli dall'API di abbonamento (/v1/models) con quelli
+        della CLI (`opencode models`) per garantire che ogni modello mostrato
+        sia effettivamente utilizzabile via CLI. Cache invalidata ogni 5 minuti
+        (o subito se force=True).
         """
         now = time.monotonic()
         cache = AIProvider._opencode_models_cache
@@ -1045,6 +1046,24 @@ class AIProvider:
         if not force and cache is not None and now - cache_time < 300:
             return list(cache)
 
+        api_models: set[str] = set()
+        api_key = os.getenv("OPENCODE_GO_API_KEY")
+        if api_key:
+            try:
+                r = requests.get(
+                    "https://opencode.ai/zen/go/v1/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=5,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    for m in data.get("data", []):
+                        mid = m.get("id", "")
+                        api_models.add(mid.removeprefix("opencode-go/"))
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+
+        cli_models: set[str] = set()
         try:
             result = subprocess.run(
                 ["opencode", "models"],
@@ -1054,19 +1073,28 @@ class AIProvider:
                 check=False,
             )
             if result.returncode == 0:
-                models = sorted({
+                cli_models = {
                     m.strip().removeprefix("opencode-go/")
                     for m in result.stdout.splitlines()
                     if m.strip().startswith("opencode-go/")
-                })
-                if models:
-                    AIProvider._opencode_models_cache = models
-                    AIProvider._opencode_models_cache_time = now
-                    return models
+                }
         except Exception:  # pylint: disable=broad-exception-caught
             pass
 
-        # Fallback alla lista hardcoded
+        if api_models and cli_models:
+            models = sorted(api_models & cli_models)
+        elif cli_models:
+            models = sorted(cli_models)
+        elif api_models:
+            models = sorted(api_models)
+        else:
+            return list(AIProvider.OPENCODE_GO_MODELS)
+
+        if models:
+            AIProvider._opencode_models_cache = models
+            AIProvider._opencode_models_cache_time = now
+            return models
+
         return list(AIProvider.OPENCODE_GO_MODELS)
 
     @staticmethod
