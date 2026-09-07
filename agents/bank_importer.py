@@ -478,3 +478,39 @@ class BankImporter:
         
         # Return aggregated df
         return pivot_df
+
+    @staticmethod
+    def build_transaction_records(detailed_df, source="bank_import"):
+        """Build transaction records (list of dicts) matching the Budget App
+        ``transactions`` table schema: date, description, amount, category,
+        source, month_ref.
+
+        Called by the Budget App after the user confirms an import, so the
+        individual (daily) transactions can be persisted alongside the monthly
+        pivot.
+        """
+        records = []
+        for _, row in detailed_df.iterrows():
+            date_obj = row.get("DateObj")
+            if pd.notna(date_obj) and hasattr(date_obj, "strftime"):
+                date_str = date_obj.strftime("%Y-%m-%d")
+            else:
+                date_str = str(row.get("Std_Date", ""))
+
+            year = row.get("Year")
+            month = row.get("Month", "")
+            month_ref = f"{month} {int(year)}" if pd.notna(year) else ""
+
+            amount = row.get("Betrag_Float", 0.0)
+
+            records.append(
+                {
+                    "date": date_str,
+                    "description": str(row.get("Std_Description", "")),
+                    "amount": float(amount) if pd.notna(amount) else 0.0,
+                    "category": str(row.get("New_Category", "") or ""),
+                    "source": source,
+                    "month_ref": month_ref,
+                }
+            )
+        return records
