@@ -10,8 +10,57 @@ import json
 import io
 from typing import TYPE_CHECKING, Optional
 
+try:
+    from .merchant_utils import normalize_merchant
+except ImportError:  # pragma: no cover - esecuzione diretta del modulo
+    from merchant_utils import normalize_merchant
+
 if TYPE_CHECKING:
     from .opencode_agent import OpencodeAgent
+
+
+# Categoria pseudo-valida usata per i trasferimenti tra conti propri e le voci
+# da escludere dai totali: viene assegnata, mostrata nella review e salvata in
+# ``transactions``, ma NON viene sommata negli aggregati (non è tra le
+# target_categories).
+EXCLUDED_CATEGORY = "Escluso"
+
+# Mappatura deterministica dei tipi di transazione di Trade Republic.
+# Priorità assoluta: un tipo strutturale (BUY/TRANSFER/...) non ha un
+# "merchant" reale, quindi va categorizzato per tipo e NON passa dall'LLM.
+TR_TYPE_MAP = {
+    "BUY": "Investimenti",
+    "TRANSFER_INSTANT_OUTBOUND": EXCLUDED_CATEGORY,
+    "TRANSFER_INSTANT_INBOUND": EXCLUDED_CATEGORY,
+    "FREE_RECEIPT": EXCLUDED_CATEGORY,
+    "BENEFITS_SAVEBACK": "Reddito aggiuntivo",
+    "INTEREST_PAYMENT": "Reddito aggiuntivo",
+}
+
+# Categorie tedesche (Anadi) con mapping deterministico -> italiano.
+# Le voci NON presenti qui (Unkategorisiert, Sonstiges, Veranlagung) vanno
+# all'LLM (o al merchant-map lookup).
+GERMAN_CATEGORY_MAP = {
+    "Lebensmittel": "Alimentari",
+    "Bargeld": "Bancomat",
+    "Versicherung": "Immobili (affitto, mutuo, tasse, assicurazione)",
+    "Wohnen & Haushalt": "Immobili (affitto, mutuo, tasse, assicurazione)",
+    "Gesundheit": "Medicinali",
+    "Einkünfte": "Stipendio",
+    "Kommunikation & Medien": "PayPal + Abbonamenti",
+}
+
+# Token "benzinaio" per discriminare Mobilität -> Carburante.
+_FUEL_TOKENS = ("JET", "DISKONT", "TANKSTELLE")
+
+# Token "ristorante/bar/caffè" per discriminare Freizeit & Genuss -> Cene, Pranzo.
+_RESTAURANT_TOKENS = (
+    "restaurant", "ristorante", "trattoria", "osteria", "pizzeria", "bar",
+    "cafe", "caff", "coffee", "bistro", "gelateria", "enoteca", "sushi",
+    "wurstel", "ditsch", "stroeck", "mcdonald", "kfc", "piadineria", "salud",
+    "racers", "mcmullens", "yarra", "meschik", "dampfer", "terrazza", "egglab",
+    "hungry", "starbucks", "bakery", "pastry", "konditorei",
+)
 
 
 class BankImporter:
@@ -29,6 +78,48 @@ class BankImporter:
         """
         self.ai_provider = ai_provider
         self.opencode_agent = opencode_agent
+
+    def _load_db(self):
+        """Importa lazy il modulo db della Budget App (opzionale).
+
+        Ritorna il modulo se importabile, altrimenti None. Così il pacchetto
+        `agents` resta installabile/importabile anche senza Budget_App: in
+        quel caso la mappatura è vuota e si procede tutto via LLM.
+        """
+        try:
+            import db as _db
+            return _db
+        except Exception:
+            return None
+
+    def _load_merchant_map(self):
+        """Ritorna {merchant_normalized: MerchantEntry} (dict vuoto se assente)."""
+        _db = self._load_db()
+        if _db is None:
+            return {}
+        try:
+            return _db.get_merchant_map()
+        except Exception:
+            return {}
+
+    def _persist_llm_mappings(self, batch_mappings, id_to_desc):
+        """Salva le categorie apprese dall'LLM come source='llm'.
+
+        Non sovrascrive MAI le correzioni manuali (garantito da upsert_merchant).
+        """
+        _db = self._load_db()
+        if _db is None:
+            return
+        for idx, category in batch_mappings.items():
+            desc = id_to_desc.get(idx)
+            if not desc:
+                continue
+            try:
+                _db.upsert_merchant(
+                    normalize_merchant(desc), category, source="llm", confidence=0.7
+                )
+            except Exception:
+                pass
 
     def _clean_amount(self, amount_str):
         """Converts German format (1.234,56) to float (1234.56)."""
@@ -77,6 +168,8 @@ class BankImporter:
         date_aliases = ['buchungsdatum', 'date', 'data', 'valuta', 'datetime', 'data contabile']
         desc_aliases = ['umsatztext', 'buchungstext', 'description', 'descrizione', 'causale', 'name', 'payment_reference', 'name des partners', 'counterparty_name', 'descrizione operazione']
         cat_aliases = ['kategorie', 'category', 'categoria']
+        name_aliases = ['name', 'counterparty_name', 'name des partners', 'descrizione operazione']
+        type_aliases = ['type', 'transaction_type', 'tipo']
 
         # 1. Amount
         df['Std_Amount'] = 0
@@ -101,6 +194,13 @@ class BankImporter:
                 df['Std_Fee'] = df[lower_cols[alias]]
                 break
 
+        # 1.6 Transaction type (Trade Republic: BUY/TRANSFER/CARD_TRANSACTION/...)
+        df['Std_Type'] = ''
+        for alias in type_aliases:
+            if alias in lower_cols:
+                df['Std_Type'] = df[lower_cols[alias]].fillna('').astype(str)
+                break
+
         # 2. Date
         df['Std_Date'] = ''
         for alias in date_aliases:
@@ -113,6 +213,13 @@ class BankImporter:
         for alias in cat_aliases:
             if alias in lower_cols:
                 df['Std_Category'] = df[lower_cols[alias]]
+                break
+
+        # 3.5 Merchant name (identità pulita del negozio, per il lookup seed)
+        df['Std_Name'] = ''
+        for alias in name_aliases:
+            if alias in lower_cols:
+                df['Std_Name'] = df[lower_cols[alias]].fillna('').astype(str)
                 break
 
         # 4. Description (Concatenate all matching description columns)
@@ -128,6 +235,49 @@ class BankImporter:
             df['Std_Description'] = ''
             
         return df
+
+    def _map_german_category(self, german_cat, desc):
+        """Mappa deterministica una categoria tedesca (Anadi) in italiano.
+
+        Ritorna la categoria italiana, oppure None per le voci NON mappabili
+        deterministicamente (Unkategorisiert/Sonstiges/Veranlagung...) che
+        devono andare all'LLM o al merchant-map lookup.
+        """
+        cat = (german_cat or "").strip()
+
+        # Mobilität: Carburante se benzinaio, altrimenti Trasporti.
+        if cat == "Mobilität":
+            d = (desc or "").upper()
+            if any(tok in d for tok in _FUEL_TOKENS):
+                return "Carburante"
+            return "Trasporti"
+
+        # Freizeit & Genuss: Cene, Pranzo se ristorante/bar/caffè dal nome.
+        if cat == "Freizeit & Genuss":
+            d = (desc or "").lower()
+            if any(tok in d for tok in _RESTAURANT_TOKENS):
+                return "Cene, Pranzo"
+            return "Viaggi, Divertimento"
+
+        if cat not in GERMAN_CATEGORY_MAP:
+            return None
+
+        return GERMAN_CATEGORY_MAP[cat]
+
+    def _map_trade_type(self, std_type):
+        """Categoria deterministica per i tipi Trade Republic, o None."""
+        t = (std_type or "").strip().upper()
+        return TR_TYPE_MAP.get(t)
+
+    def _deterministic_category(self, std_type, std_category, desc):
+        """Categoria deterministica (senza LLM) per una riga, o None.
+
+        Priorità: tipo Trade Republic (strutturale) -> categoria tedesca.
+        """
+        det = self._map_trade_type(std_type)
+        if det is not None:
+            return det
+        return self._map_german_category(std_category, desc)
 
     def process_file(self, file_buffer, target_categories, income_cols, progress_callback=None):
         """
@@ -177,24 +327,72 @@ class BankImporter:
             model = self.ai_provider.get_model(json_mode=True)
 
         mappings = {}
-        
-        # Keep original category for comparison (if present, else empty)
-        df['Analyzed_Category'] = df['Std_Category']
+
+        # 2.5 Merchant-map pre-lookup: le transazioni già note NON vanno all'LLM.
+        merchant_map = self._load_merchant_map()
+
+        # Categoria deterministica (tipo Trade Republic / categoria tedesca)
+        # calcolata per riga. Serve a mostrare una categoria italiana valida
+        # anche per le righe non processate dall'LLM.
+        deterministic = {}
+        for index, row in df.iterrows():
+            deterministic[index] = self._deterministic_category(
+                row.get('Std_Type', ''),
+                row.get('Std_Category', ''),
+                row.get('Std_Description', ''),
+            )
+
+        # Analyzed_Category = categoria deterministica se presente, altrimenti
+        # la categoria originale (per il confronto nella review/report).
+        df['Analyzed_Category'] = [
+            deterministic.get(i) or str(df.at[i, 'Std_Category'])
+            for i in df.index
+        ]
 
         items_to_process = []
+        id_to_desc = {}
         for index, row in df.iterrows():
             desc = row.get('Std_Description', '')
             amount = row.get('Std_Amount', '0')
             old_cat = row.get('Std_Category', '')
-            
-            items_to_process.append({
+            std_name = row.get('Std_Name', '')
+            std_type = row.get('Std_Type', '')
+
+            item = {
                 "id": index,
                 "description": desc,
                 "amount": amount,
                 "old_category": old_cat
-            })
+            }
+            id_to_desc[index] = desc
 
-        # 3. Process in Batches
+            # 1) Tipo Trade Republic (strutturale): priorità massima. Per i tipi
+            #    BUY/TRANSFER/FREE_RECEIPT/... il campo "name" NON è un negozio
+            #    ma il titolo/counterparty, quindi va categorizzato per tipo.
+            det_type = self._map_trade_type(std_type)
+            if det_type is not None:
+                mappings[index] = det_type
+                continue
+
+            # 2) Merchant-map lookup: usa il nome pulito se presente, altrimenti
+            #    la descrizione. Qualunque categoria (INCLUSA 'Escluso') viene
+            #    assegnata direttamente, saltando l'LLM.
+            key = normalize_merchant(std_name) or normalize_merchant(desc)
+            entry = merchant_map.get(key) if key else None
+            if entry is not None:
+                mappings[index] = entry.category
+                continue
+
+            # 3) Categoria tedesca deterministica (Anadi): salta l'LLM.
+            det_german = self._map_german_category(old_cat, desc)
+            if det_german is not None:
+                mappings[index] = det_german
+                continue
+
+            # 4) Altrimenti -> LLM.
+            items_to_process.append(item)
+
+        # 3. Process in Batches (solo le transazioni non note)
         
         BATCH_SIZE = 20
         total_batches = (len(items_to_process) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -204,25 +402,31 @@ class BankImporter:
             if progress_callback:
                 # Adjust progress to account for PDF step
                 base_c = 0.2 if file_name.endswith('.pdf') else 0.0
-                percent = base_c + (i / len(items_to_process)) * (0.9 - base_c)
-                progress_callback(percent, f"Analisi AI in corso: Batch {current_batch_num}/{total_batches}...")
+                if items_to_process:
+                    percent = base_c + (i / len(items_to_process)) * (0.9 - base_c)
+                else:
+                    percent = 0.9
+                progress_callback(percent, f"Analisi AI in corso: Batch {current_batch_num}/{max(total_batches, 1)}...")
             
             batch = items_to_process[i:i+BATCH_SIZE]
 
             if self.opencode_agent:
                 batch_mappings = self._categorize_with_opencode(batch, target_categories)
-                if batch_mappings:
-                    mappings.update(batch_mappings)
             else:
-                self._categorize_with_ai(model, batch, target_categories, mappings)
+                batch_mappings = self._categorize_with_ai(model, batch, target_categories)
+
+            if batch_mappings:
+                mappings.update(batch_mappings)
+                self._persist_llm_mappings(batch_mappings, id_to_desc)
         
         if progress_callback:
             progress_callback(0.9, "Applicazione modifiche e calcoli finali...")
 
         # 4. Apply Mappings
-        df['New_Category'] = df['Analyzed_Category'] # Default
+        df['New_Category'] = df['Analyzed_Category']  # Default
+        valid_cats = set(target_categories) | {EXCLUDED_CATEGORY}
         for idx, new_cat in mappings.items():
-            if idx in df.index and new_cat in target_categories:
+            if idx in df.index and new_cat in valid_cats:
                 df.at[idx, 'New_Category'] = new_cat
 
         # 5. Clean Data for Aggregation
@@ -322,8 +526,11 @@ class BankImporter:
         return df 
 
 
-    def _categorize_with_ai(self, model, batch, target_categories, mappings):
-        """Categorize a batch using the AIProvider model."""
+    def _categorize_with_ai(self, model, batch, target_categories):
+        """Categorize a batch using the AIProvider model.
+
+        Ritorna un dict {id: new_category} delle categorie assegnate.
+        """
         prompt_text = f"""
         You are an expert financial assistant.
         Your task is to MAP bank transactions to valid budget categories.
@@ -357,10 +564,13 @@ class BankImporter:
             if "```json" in text_response:
                 text_response = text_response.replace("```json", "").replace("```", "")
             result = json.loads(text_response)
+            batch_mappings = {}
             for m in result.get("mappings", []):
-                mappings[m['id']] = m['new_category']
+                batch_mappings[m['id']] = m['new_category']
+            return batch_mappings
         except Exception as e:
             print(f"Error in AI categorization: {e}")
+            return {}
 
     def _categorize_with_opencode(self, batch, target_categories):
         """Categorize a batch of transactions using OpencodeAgent."""
