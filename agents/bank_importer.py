@@ -7,10 +7,14 @@ to match the Budget Application's database schema.
 
 import io
 import json
+import logging
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 import pandas as pd
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 try:
     from .merchant_utils import normalize_merchant
@@ -65,6 +69,20 @@ _RESTAURANT_TOKENS = (
 )
 
 
+class AiStats(BaseModel):
+    """Statistiche del run di categorizzazione AI (diagnostica UI).
+
+    Serializzata da ``process_file`` sotto la chiave ``ai_stats``. Retro-
+    compatibile: è una chiave nuova e non sostituisce le esistenti.
+    """
+
+    mode: Literal["hybrid", "llm_only"] = "hybrid"
+    llm_sent: int = 0
+    llm_mapped: int = 0
+    llm_failed: int = 0
+    errors: List[str] = Field(default_factory=list)
+
+
 class BankImporter:
     """Handles the import and processing of bank statements."""
 
@@ -80,6 +98,17 @@ class BankImporter:
         """
         self.ai_provider = ai_provider
         self.opencode_agent = opencode_agent
+
+    @staticmethod
+    def _record_ai_error(stats, message: str) -> None:
+        """Logga un errore di categorizzazione AI e lo accumula in ``stats``.
+
+        NON solleva eccezioni: un fallimento della categorizzazione resta un
+        dato del run (visibile nella UI), non un crash per l'utente.
+        """
+        logger.error("Categorizzazione AI fallita: %s", message)
+        if stats is not None and len(stats.errors) < 20:
+            stats.errors.append(str(message)[:500])
 
     def _load_db(self):
         """Importa lazy il modulo db della Budget App (opzionale).
@@ -428,6 +457,10 @@ class BankImporter:
             #    arriva sempre qui per essere categorizzata dal modello.
             items_to_process.append(item)
 
+        # Statistiche diagnostiche del run AI (niente più fallimenti silenziosi).
+        ai_stats = AiStats(mode=classify_mode, llm_sent=len(items_to_process))
+        valid_cats = set(target_categories) | {EXCLUDED_CATEGORY}
+
         # 3. Process in Batches (solo le transazioni non note)
         
         BATCH_SIZE = 20
@@ -447,20 +480,26 @@ class BankImporter:
             batch = items_to_process[i:i+BATCH_SIZE]
 
             if self.opencode_agent:
-                batch_mappings = self._categorize_with_opencode(batch, target_categories)
+                batch_mappings = self._categorize_with_opencode(
+                    batch, target_categories, ai_stats
+                )
             else:
-                batch_mappings = self._categorize_with_ai(model, batch, target_categories)
+                batch_mappings = self._categorize_with_ai(
+                    model, batch, target_categories, ai_stats
+                )
 
             if batch_mappings:
                 mappings.update(batch_mappings)
                 self._persist_llm_mappings(batch_mappings, id_to_desc)
+                ai_stats.llm_mapped += sum(
+                    1 for cat in batch_mappings.values() if cat in valid_cats
+                )
         
         if progress_callback:
             progress_callback(0.9, "Applicazione modifiche e calcoli finali...")
 
         # 4. Apply Mappings
         df['New_Category'] = df['Analyzed_Category']  # Default
-        valid_cats = set(target_categories) | {EXCLUDED_CATEGORY}
         for idx, new_cat in mappings.items():
             if idx in df.index and new_cat in valid_cats:
                 df.at[idx, 'New_Category'] = new_cat
@@ -504,13 +543,16 @@ class BankImporter:
         # 7. Aggregate
         aggregated_df = self.aggregate_data(df, target_categories, income_cols)
         
+        ai_stats.llm_failed = max(ai_stats.llm_sent - ai_stats.llm_mapped, 0)
+
         if progress_callback:
             progress_callback(1.0, "Fatto!")
 
         return {
             'detailed_df': df,
             'aggregated_df': aggregated_df,
-            'report_md': report_md
+            'report_md': report_md,
+            'ai_stats': ai_stats.model_dump(),
         }
 
     def _extract_from_pdf(self, pdf_bytes):
@@ -692,19 +734,23 @@ class BankImporter:
 
         return result
 
-    def _categorize_with_ai(self, model, batch, target_categories):
+    def _categorize_with_ai(self, model, batch, target_categories, stats=None):
         """Categorize a batch using the AIProvider model.
 
         Uses the compact letter schema (one letter per transaction) and falls
         back to the legacy verbose JSON schema when the category list cannot be
         encoded as single letters or the letter response is unparsable.
 
-        Ritorna un dict {id: new_category} delle categorie assegnate.
+        Ritorna un dict {id: new_category} delle categorie assegnate. In caso di
+        errore provider/parsing logga e accumula la diagnostica in ``stats``
+        (NON solleva eccezioni).
         """
         letter_index = self._build_letter_index(target_categories)
         if letter_index is None:
-            print("More than 26 categories: using verbose JSON schema.")
-            return self._categorize_with_ai_json(model, batch, target_categories)
+            logger.warning("Più di 26 categorie: uso lo schema JSON verboso.")
+            return self._categorize_with_ai_json(
+                model, batch, target_categories, stats
+            )
 
         prompt_text = self._build_letter_prompt(batch, letter_index)
         try:
@@ -712,14 +758,20 @@ class BankImporter:
             text_response = response.text if hasattr(response, 'text') else str(response)
             batch_mappings = self._parse_letter_mappings(text_response, batch, letter_index)
             if not batch_mappings:
-                print("Letter schema unusable: falling back to verbose JSON schema.")
-                return self._categorize_with_ai_json(model, batch, target_categories)
+                logger.warning(
+                    "Schema a lettere inutilizzabile: fallback a JSON verboso."
+                )
+                return self._categorize_with_ai_json(
+                    model, batch, target_categories, stats
+                )
             return batch_mappings
-        except Exception as e:
-            print(f"Error in AI categorization: {e}")
+        except Exception as e:  # pylint: disable=broad-except
+            self._record_ai_error(
+                stats, f"AIProvider (letter schema) error: {e!r}"
+            )
             return {}
 
-    def _categorize_with_ai_json(self, model, batch, target_categories):
+    def _categorize_with_ai_json(self, model, batch, target_categories, stats=None):
         """Legacy verbose categorization path (one full category per id).
 
         Kept as a defensive fallback for the letter schema.
@@ -751,6 +803,7 @@ class BankImporter:
         Return JSON:
         {{ "mappings": [ {{ "id": <id>, "new_category": "<ValidCategory>" }} ] }}
         """
+        text_response = ""
         try:
             response = model.generate_content(prompt_text)
             text_response = response.text if hasattr(response, 'text') else str(response)
@@ -761,34 +814,47 @@ class BankImporter:
             for m in result.get("mappings", []):
                 batch_mappings[m['id']] = m['new_category']
             return batch_mappings
-        except Exception as e:
-            print(f"Error in AI categorization: {e}")
+        except Exception as e:  # pylint: disable=broad-except
+            self._record_ai_error(
+                stats,
+                f"AIProvider (JSON schema) error: {e!r}; "
+                f"raw={text_response[:500]!r}",
+            )
             return {}
 
-    def _categorize_with_opencode(self, batch, target_categories):
+    def _categorize_with_opencode(self, batch, target_categories, stats=None):
         """Categorize a batch of transactions using OpencodeAgent.
 
         Uses the compact letter schema with a verbose JSON fallback (see
-        ``_categorize_with_ai``).
+        ``_categorize_with_ai``). Gli errori provider/parsing sono loggati e
+        accumulati in ``stats`` invece di essere silenziosi.
         """
         letter_index = self._build_letter_index(target_categories)
         if letter_index is None:
-            print("More than 26 categories: using verbose JSON schema.")
-            return self._categorize_with_opencode_json(batch, target_categories)
+            logger.warning("Più di 26 categorie: uso lo schema JSON verboso.")
+            return self._categorize_with_opencode_json(
+                batch, target_categories, stats
+            )
 
         prompt_text = self._build_letter_prompt(batch, letter_index)
         result = self.opencode_agent.run_prompt(prompt_text)
         if not result.success:
-            print(f"OpenCode error: {result.error}")
+            self._record_ai_error(
+                stats, f"OpenCode (letter schema) error: {result.error}"
+            )
             return {}
 
         batch_mappings = self._parse_letter_mappings(result.text, batch, letter_index)
         if not batch_mappings:
-            print("Letter schema unusable: falling back to verbose JSON schema.")
-            return self._categorize_with_opencode_json(batch, target_categories)
+            logger.warning(
+                "Schema a lettere inutilizzabile: fallback a JSON verboso."
+            )
+            return self._categorize_with_opencode_json(
+                batch, target_categories, stats
+            )
         return batch_mappings
 
-    def _categorize_with_opencode_json(self, batch, target_categories):
+    def _categorize_with_opencode_json(self, batch, target_categories, stats=None):
         """Legacy verbose OpenCode categorization path (fallback)."""
         prompt_text = f"""
         You are an expert financial assistant.
@@ -819,7 +885,9 @@ class BankImporter:
         """
         result = self.opencode_agent.run_prompt(prompt_text)
         if not result.success:
-            print(f"OpenCode error: {result.error}")
+            self._record_ai_error(
+                stats, f"OpenCode (JSON schema) error: {result.error}"
+            )
             return {}
 
         text = result.text.strip()
@@ -835,7 +903,10 @@ class BankImporter:
                 batch_mappings[m['id']] = m['new_category']
             return batch_mappings
         except (json.JSONDecodeError, KeyError) as e:
-            print(f"Error parsing OpenCode response: {e}")
+            self._record_ai_error(
+                stats,
+                f"OpenCode (JSON schema) parse error: {e!r}; raw={text[:500]!r}",
+            )
             return {}
 
     def generate_report(self, df):
