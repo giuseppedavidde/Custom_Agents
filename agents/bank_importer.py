@@ -5,10 +5,12 @@ categorize its transactions using an AI model, and aggregate the results
 to match the Budget Application's database schema.
 """
 
-import pandas as pd
-import json
 import io
-from typing import TYPE_CHECKING, Optional
+import json
+import re
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+import pandas as pd
 
 try:
     from .merchant_utils import normalize_merchant
@@ -526,10 +528,167 @@ class BankImporter:
         return df 
 
 
+    @staticmethod
+    def _build_letter_index(target_categories: List[str]) -> Optional[Dict[str, str]]:
+        """Builds a compact ``LETTER -> category`` index for the AI prompt.
+
+        Assigns A..Z to the first 26 categories. Returns ``None`` when the
+        category list cannot be encoded with single letters, so callers can
+        fall back to the legacy verbose JSON schema.
+        """
+        if not target_categories or len(target_categories) > 26:
+            return None
+        return {
+            chr(ord("A") + i): cat
+            for i, cat in enumerate(target_categories)
+        }
+
+    @staticmethod
+    def _build_letter_prompt(batch: List[Dict[str, Any]], letter_index: Dict[str, str]) -> str:
+        """Builds the ultra-compact categorization prompt (letter schema).
+
+        Instead of repeating the full category name for every transaction, the
+        model only has to emit one letter per id, drastically shrinking the
+        generated output.
+        """
+        letters_block = "\n".join(
+            f"{letter}={cat}" for letter, cat in letter_index.items()
+        )
+        return f"""
+        You are an expert financial assistant.
+        Your task is to MAP bank transactions to valid budget categories.
+
+        CATEGORY_LETTERS (answer with the single LETTER, not the full name):
+        {letters_block}
+
+        RULES:
+        1. "Freizeit & Genuss" is generic. You MUST be specific based on the description:
+        - Restaurants, Bars, Food delivery -> 'Cene, Pranzo'
+        - Pharmacies (Apotheke, DM often), Doctors -> 'Medicinali'
+        - Trains, Buses, Taxi, Uber -> 'Trasporti'
+        - Flights, Hotels, Airbnb, Cinema, Events -> 'Viaggi, Divertimento'
+        - Gas stations (Tankstelle) -> 'Carburante'
+        - Subscriptions (Spotify, Netflix) -> 'PayPal + Abbonamenti'
+        2. "Lebensmittel" (Groceries) or Supermarkets -> 'Alimentari'.
+        3. "Mobilität" usually maps to 'Carburante' or 'Trasporti'.
+        4. "Miete" (Rent) / Insurance -> 'Immobili (affitto, mutuo, tasse, assicurazione)'.
+        5. Salary/Wages -> 'Stipendio'.
+        6. Incoming transfers -> 'Reddito aggiuntivo' (unless typical salary).
+
+        TRANSACTIONS:
+        {json.dumps(batch)}
+
+        Return ONLY a JSON object mapping each transaction id to its single
+        category LETTER, e.g. {{"12":"A","13":"C"}}.
+        """
+
+    @staticmethod
+    def _parse_letter_mappings(
+        text: str,
+        batch: List[Dict[str, Any]],
+        letter_index: Dict[str, str],
+    ) -> Dict[int, str]:
+        """Parses the compact ``{"id": "LETTER"}`` AI response.
+
+        Accepts JSON objects (also wrapped in markdown fences or embedded in
+        prose) and plain ``id: LETTER`` / ``id=LETTER`` lines. Ids not present
+        in ``batch`` and letters outside ``letter_index`` are ignored.
+
+        Returns ``{index: category}``.
+        """
+        if not text or not letter_index:
+            return {}
+
+        valid_ids = {
+            int(item["id"])
+            for item in batch
+            if item.get("id") is not None
+        }
+        upper_index = {key.upper(): value for key, value in letter_index.items()}
+
+        def _letter_to_category(raw: Any) -> Optional[str]:
+            if raw is None:
+                return None
+            match = re.search(r"[A-Za-z]", str(raw))
+            if not match:
+                return None
+            return upper_index.get(match.group(0).upper())
+
+        cleaned = text.strip()
+        if "```json" in cleaned:
+            cleaned = cleaned.split("```json")[1].split("```")[0]
+        elif "```" in cleaned:
+            parts = cleaned.split("```")
+            if len(parts) >= 2:
+                cleaned = parts[1]
+        cleaned = cleaned.strip()
+
+        result: Dict[int, str] = {}
+
+        candidate = cleaned
+        if not candidate.startswith("{"):
+            start, end = candidate.find("{"), candidate.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                candidate = candidate[start:end + 1]
+        if candidate.startswith("{"):
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    try:
+                        tid = int(str(key).strip().strip('"').strip("'"))
+                    except (TypeError, ValueError):
+                        continue
+                    if tid not in valid_ids:
+                        continue
+                    category = _letter_to_category(value)
+                    if category:
+                        result[tid] = category
+
+        if not result:
+            for match in re.finditer(r"[\"']?(\d+)[\"']?\s*[:=]\s*[\"']?([A-Za-z])", cleaned):
+                tid = int(match.group(1))
+                if tid not in valid_ids:
+                    continue
+                category = upper_index.get(match.group(2).upper())
+                if category:
+                    result[tid] = category
+
+        return result
+
     def _categorize_with_ai(self, model, batch, target_categories):
         """Categorize a batch using the AIProvider model.
 
+        Uses the compact letter schema (one letter per transaction) and falls
+        back to the legacy verbose JSON schema when the category list cannot be
+        encoded as single letters or the letter response is unparsable.
+
         Ritorna un dict {id: new_category} delle categorie assegnate.
+        """
+        letter_index = self._build_letter_index(target_categories)
+        if letter_index is None:
+            print("More than 26 categories: using verbose JSON schema.")
+            return self._categorize_with_ai_json(model, batch, target_categories)
+
+        prompt_text = self._build_letter_prompt(batch, letter_index)
+        try:
+            response = model.generate_content(prompt_text)
+            text_response = response.text if hasattr(response, 'text') else str(response)
+            batch_mappings = self._parse_letter_mappings(text_response, batch, letter_index)
+            if not batch_mappings:
+                print("Letter schema unusable: falling back to verbose JSON schema.")
+                return self._categorize_with_ai_json(model, batch, target_categories)
+            return batch_mappings
+        except Exception as e:
+            print(f"Error in AI categorization: {e}")
+            return {}
+
+    def _categorize_with_ai_json(self, model, batch, target_categories):
+        """Legacy verbose categorization path (one full category per id).
+
+        Kept as a defensive fallback for the letter schema.
         """
         prompt_text = f"""
         You are an expert financial assistant.
@@ -573,7 +732,30 @@ class BankImporter:
             return {}
 
     def _categorize_with_opencode(self, batch, target_categories):
-        """Categorize a batch of transactions using OpencodeAgent."""
+        """Categorize a batch of transactions using OpencodeAgent.
+
+        Uses the compact letter schema with a verbose JSON fallback (see
+        ``_categorize_with_ai``).
+        """
+        letter_index = self._build_letter_index(target_categories)
+        if letter_index is None:
+            print("More than 26 categories: using verbose JSON schema.")
+            return self._categorize_with_opencode_json(batch, target_categories)
+
+        prompt_text = self._build_letter_prompt(batch, letter_index)
+        result = self.opencode_agent.run_prompt(prompt_text)
+        if not result.success:
+            print(f"OpenCode error: {result.error}")
+            return {}
+
+        batch_mappings = self._parse_letter_mappings(result.text, batch, letter_index)
+        if not batch_mappings:
+            print("Letter schema unusable: falling back to verbose JSON schema.")
+            return self._categorize_with_opencode_json(batch, target_categories)
+        return batch_mappings
+
+    def _categorize_with_opencode_json(self, batch, target_categories):
+        """Legacy verbose OpenCode categorization path (fallback)."""
         prompt_text = f"""
         You are an expert financial assistant.
         Your task is to MAP bank transactions to valid budget categories.
