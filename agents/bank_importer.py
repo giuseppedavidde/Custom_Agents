@@ -8,7 +8,7 @@ to match the Budget Application's database schema.
 import io
 import json
 import re
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 import pandas as pd
 
@@ -281,7 +281,14 @@ class BankImporter:
             return det
         return self._map_german_category(std_category, desc)
 
-    def process_file(self, file_buffer, target_categories, income_cols, progress_callback=None):
+    def process_file(
+        self,
+        file_buffer,
+        target_categories,
+        income_cols,
+        progress_callback=None,
+        classify_mode: Literal["hybrid", "llm_only"] = "hybrid",
+    ):
         """
         Processes the uploaded bank file (CSV or PDF).
         
@@ -290,6 +297,13 @@ class BankImporter:
             target_categories (list): List of valid expense/income categories.
             income_cols (list): List of categories considered as Income.
             progress_callback (func): Optional callback (percent: float, message: str).
+            classify_mode (Literal["hybrid", "llm_only"]): Modalità di
+                classificazione. "hybrid" (default) usa le scorciatoie
+                deterministiche (tipo Trade Republic, merchant_map, categoria
+                tedesca) e invia all'LLM solo il residuo. "llm_only" bypassa
+                TUTTE le scorciatoie deterministiche: ogni transazione passa
+                dall'LLM (utile per misurare l'Opzione A senza che la mappatura
+                negozi->categorie "nasconda" il lavoro del modello).
 
         Returns:
             dict: {
@@ -298,6 +312,12 @@ class BankImporter:
                 'report_md': Markdown string for the comparison report.
             }
         """
+        if classify_mode not in ("hybrid", "llm_only"):
+            raise ValueError(
+                f"classify_mode non valido: {classify_mode!r}. "
+                "Valori ammessi: 'hybrid', 'llm_only'."
+            )
+
         # 0. Detect File Type
         file_name = file_buffer.name.lower()
         
@@ -331,25 +351,37 @@ class BankImporter:
         mappings = {}
 
         # 2.5 Merchant-map pre-lookup: le transazioni già note NON vanno all'LLM.
-        merchant_map = self._load_merchant_map()
+        # In modalità "llm_only" la mappa viene bypassata per intero, così ogni
+        # transazione passa dall'LLM (misura pulita dell'Opzione A).
+        if classify_mode == "hybrid":
+            merchant_map = self._load_merchant_map()
+        else:
+            merchant_map = {}
 
-        # Categoria deterministica (tipo Trade Republic / categoria tedesca)
-        # calcolata per riga. Serve a mostrare una categoria italiana valida
-        # anche per le righe non processate dall'LLM.
-        deterministic = {}
-        for index, row in df.iterrows():
-            deterministic[index] = self._deterministic_category(
-                row.get('Std_Type', ''),
-                row.get('Std_Category', ''),
-                row.get('Std_Description', ''),
-            )
+        if classify_mode == "hybrid":
+            # Categoria deterministica (tipo Trade Republic / categoria tedesca)
+            # calcolata per riga. Serve a mostrare una categoria italiana valida
+            # anche per le righe non processate dall'LLM.
+            deterministic = {}
+            for index, row in df.iterrows():
+                deterministic[index] = self._deterministic_category(
+                    row.get('Std_Type', ''),
+                    row.get('Std_Category', ''),
+                    row.get('Std_Description', ''),
+                )
 
-        # Analyzed_Category = categoria deterministica se presente, altrimenti
-        # la categoria originale (per il confronto nella review/report).
-        df['Analyzed_Category'] = [
-            deterministic.get(i) or str(df.at[i, 'Std_Category'])
-            for i in df.index
-        ]
+            # Analyzed_Category = categoria deterministica se presente, altrimenti
+            # la categoria originale (per il confronto nella review/report).
+            df['Analyzed_Category'] = [
+                deterministic.get(i) or str(df.at[i, 'Std_Category'])
+                for i in df.index
+            ]
+        else:
+            # Modalità "llm_only": nessuna scorciatoia deterministica.
+            # Analyzed_Category coincide con la categoria originale della banca.
+            df['Analyzed_Category'] = [
+                str(df.at[i, 'Std_Category']) for i in df.index
+            ]
 
         items_to_process = []
         id_to_desc = {}
@@ -368,30 +400,32 @@ class BankImporter:
             }
             id_to_desc[index] = desc
 
-            # 1) Tipo Trade Republic (strutturale): priorità massima. Per i tipi
-            #    BUY/TRANSFER/FREE_RECEIPT/... il campo "name" NON è un negozio
-            #    ma il titolo/counterparty, quindi va categorizzato per tipo.
-            det_type = self._map_trade_type(std_type)
-            if det_type is not None:
-                mappings[index] = det_type
-                continue
+            if classify_mode == "hybrid":
+                # 1) Tipo Trade Republic (strutturale): priorità massima. Per i tipi
+                #    BUY/TRANSFER/FREE_RECEIPT/... il campo "name" NON è un negozio
+                #    ma il titolo/counterparty, quindi va categorizzato per tipo.
+                det_type = self._map_trade_type(std_type)
+                if det_type is not None:
+                    mappings[index] = det_type
+                    continue
 
-            # 2) Merchant-map lookup: usa il nome pulito se presente, altrimenti
-            #    la descrizione. Qualunque categoria (INCLUSA 'Escluso') viene
-            #    assegnata direttamente, saltando l'LLM.
-            key = normalize_merchant(std_name) or normalize_merchant(desc)
-            entry = merchant_map.get(key) if key else None
-            if entry is not None:
-                mappings[index] = entry.category
-                continue
+                # 2) Merchant-map lookup: usa il nome pulito se presente, altrimenti
+                #    la descrizione. Qualunque categoria (INCLUSA 'Escluso') viene
+                #    assegnata direttamente, saltando l'LLM.
+                key = normalize_merchant(std_name) or normalize_merchant(desc)
+                entry = merchant_map.get(key) if key else None
+                if entry is not None:
+                    mappings[index] = entry.category
+                    continue
 
-            # 3) Categoria tedesca deterministica (Anadi): salta l'LLM.
-            det_german = self._map_german_category(old_cat, desc)
-            if det_german is not None:
-                mappings[index] = det_german
-                continue
+                # 3) Categoria tedesca deterministica (Anadi): salta l'LLM.
+                det_german = self._map_german_category(old_cat, desc)
+                if det_german is not None:
+                    mappings[index] = det_german
+                    continue
 
-            # 4) Altrimenti -> LLM.
+            # 4) Altrimenti -> LLM. In modalità "llm_only" ogni transazione
+            #    arriva sempre qui per essere categorizzata dal modello.
             items_to_process.append(item)
 
         # 3. Process in Batches (solo le transazioni non note)
