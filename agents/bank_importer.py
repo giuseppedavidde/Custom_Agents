@@ -17,9 +17,10 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 try:
-    from .merchant_utils import normalize_merchant
+    # normalize_merchant è mantenuto per retrocompatibilità (ex API di modulo).
+    from .merchant_utils import merchant_keys, normalize_merchant  # pylint: disable=unused-import
 except ImportError:  # pragma: no cover - esecuzione diretta del modulo
-    from merchant_utils import normalize_merchant
+    from merchant_utils import merchant_keys, normalize_merchant
 
 if TYPE_CHECKING:
     from .opencode_agent import OpencodeAgent
@@ -133,8 +134,13 @@ class BankImporter:
         except Exception:
             return {}
 
-    def _persist_llm_mappings(self, batch_mappings, id_to_desc):
+    def _persist_llm_mappings(self, batch_mappings, id_to_keys):
         """Salva le categorie apprese dall'LLM come source='llm'.
+
+        ``id_to_keys`` mappa l'indice riga a una chiave (str) oppure a una lista
+        di chiavi candidate (nome pulito + descrizione, vedi ``merchant_keys``).
+        Ogni chiave candidata viene persistita, così la mappatura è ritrovata
+        qualunque chiave usi il lookup al prossimo import.
 
         Non sovrascrive MAI le correzioni manuali (garantito da upsert_merchant).
         """
@@ -142,15 +148,17 @@ class BankImporter:
         if _db is None:
             return
         for idx, category in batch_mappings.items():
-            desc = id_to_desc.get(idx)
-            if not desc:
+            raw_keys = id_to_keys.get(idx)
+            if not raw_keys:
                 continue
-            try:
-                _db.upsert_merchant(
-                    normalize_merchant(desc), category, source="llm", confidence=0.7
-                )
-            except Exception:
-                pass
+            keys = [raw_keys] if isinstance(raw_keys, str) else list(raw_keys)
+            for key in keys:
+                if not key:
+                    continue
+                try:
+                    _db.upsert_merchant(key, category, source="llm", confidence=0.7)
+                except Exception:  # pylint: disable=broad-except
+                    pass
 
     def _clean_amount(self, amount_str):
         """Converts German format (1.234,56) to float (1234.56)."""
@@ -413,7 +421,7 @@ class BankImporter:
             ]
 
         items_to_process = []
-        id_to_desc = {}
+        id_to_keys = {}
         for index, row in df.iterrows():
             desc = row.get('Std_Description', '')
             amount = row.get('Std_Amount', '0')
@@ -427,7 +435,7 @@ class BankImporter:
                 "amount": amount,
                 "old_category": old_cat
             }
-            id_to_desc[index] = desc
+            id_to_keys[index] = merchant_keys(std_name, desc)
 
             if classify_mode == "hybrid":
                 # 1) Tipo Trade Republic (strutturale): priorità massima. Per i tipi
@@ -438,11 +446,16 @@ class BankImporter:
                     mappings[index] = det_type
                     continue
 
-                # 2) Merchant-map lookup: usa il nome pulito se presente, altrimenti
-                #    la descrizione. Qualunque categoria (INCLUSA 'Escluso') viene
-                #    assegnata direttamente, saltando l'LLM.
-                key = normalize_merchant(std_name) or normalize_merchant(desc)
-                entry = merchant_map.get(key) if key else None
+                # 2) Merchant-map lookup: prova ogni chiave candidata in ordine
+                #    (nome pulito prima, poi descrizione). Qualunque categoria
+                #    (INCLUSA 'Escluso') viene assegnata direttamente, saltando
+                #    l'LLM. Così una correzione salvata sotto 'Std_Name' o sotto
+                #    descrizione viene comunque ritrovata.
+                entry = None
+                for key in merchant_keys(std_name, desc):
+                    entry = merchant_map.get(key)
+                    if entry is not None:
+                        break
                 if entry is not None:
                     mappings[index] = entry.category
                     continue
@@ -490,7 +503,7 @@ class BankImporter:
 
             if batch_mappings:
                 mappings.update(batch_mappings)
-                self._persist_llm_mappings(batch_mappings, id_to_desc)
+                self._persist_llm_mappings(batch_mappings, id_to_keys)
                 ai_stats.llm_mapped += sum(
                     1 for cat in batch_mappings.values() if cat in valid_cats
                 )

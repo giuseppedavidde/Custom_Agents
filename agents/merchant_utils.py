@@ -96,3 +96,21 @@ def normalize_merchant(desc: str) -> str:
     s = _strip_store_suffix(s.split())
 
     return s[:60].strip()
+
+
+def merchant_keys(std_name: str, desc: str) -> list[str]:
+    """Chiavi candidate (dedup, non vuote) per la mappatura merchant.
+
+    Ordine: nome pulito prima, descrizione poi. Si usa la STESSA lista sia in
+    fase di lookup (import) sia in fase di salvataggio (apprendimento LLM /
+    correzione manuale), così qualunque chiave venga salvata è garantito che
+    venga ritrovata al successivo import.
+
+    Esempio: ``merchant_keys("HOTEL TRIESTE", "IT 24,00 POS ... HOTEL TRIESTE")``
+    -> ``["hotel trieste", "it 24 00 pos ... hotel trieste"]``.
+    """
+    keys: list[str] = []
+    for candidate in (normalize_merchant(std_name), normalize_merchant(desc)):
+        if candidate and candidate not in keys:
+            keys.append(candidate)
+    return keys
